@@ -196,7 +196,7 @@ Each transaction costs a replica about 8 ms of CPU: 1.1 cores for about 130 tran
 - As soon as the request load stops, they publish about 1,300 events per second.
 - The backlog drains 61 seconds after the load stops. Its tail is the hot wallets' events: one event per wallet per round, in commit order, about 65 events per second per wallet.
 
-The roles can be split (`APP_ROLES`), so a deployment that must keep the outbox current under peak load would give it processes of its own. Per-wallet ordering costs the most on a hot wallet, and only there: every other wallet's events keep flowing in the same rounds.
+The roles can be split (`APP_ROLES`), so a deployment that must keep the outbox current under peak load would give it processes of its own. Per-wallet ordering costs the most on a hot wallet: every other wallet's events keep flowing in the same rounds, but each round first reads the hot wallets' backlog, which stays cheap only while that backlog is small ([below](#the-claim-behind-a-large-backlog)).
 
 **Correctness does not depend on the load.** At every step, saturation included, each transaction was stored exactly once and none was lost, the replicas' counters agreed with the database, every message was processed once with its inbox row, and every balance equalled its ledger.
 
@@ -222,6 +222,28 @@ The method changed too. The queue phase moved before the steps, because after th
 
 The correctness checks also went through two independent reviews. The first version compared k6 with the replicas' counters, allowing one extra transaction per unknown outcome, and that slack could hide a double count. The checks now take the database as the reference, and they look up every unknown outcome instead of allowing slack for it. They compare a replay's whole outcome, and they detect a restart by the process start time.
 
+## The claim behind a large backlog
+
+A review of the claim pointed out that its cost grows with the events queued behind the heads it finds. The load test's backlogs were too small to show it, so it was measured on its own.
+
+**Method.** Each scenario ran in a scratch database with the real schema (`pg_dump --schema-only`), in the same PostgreSQL container. It inserted a backlog of due events first, then one due event for each of 50 other wallets, then ran `VACUUM ANALYZE`; payloads averaged 789 bytes, against 795 for real events. The claim's exact SQL then ran six times under `EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)`, the first as a warm-up, and five times more timed from the client as a cross-check.
+
+| Backlog | Held by | Events read past | Claim, median |
+|---|---|---|---|
+| 10,000 events | 1 wallet | 9,999 | 74 ms |
+| 100,000 events | 1 wallet | 99,999 | 0.77 s |
+| 300,000 events | 1 wallet | 299,999 | 2.6 s |
+| 1,000,000 events | 1 wallet | 999,999 | 9.7 s |
+| 1,000,000 events | 1,000 wallets | 0 | 0.3 ms |
+
+- **A claim reads every event behind the heads it can take, until its batch is full.** That costs 7 to 8 µs per event while the table fits in PostgreSQL's 128 MB of shared buffers, and up to 10 µs beyond. Each claim on a single wallet's backlog took that wallet's head and nine of the other wallets', but only after reading the whole backlog, which holds the oldest sequences. Spread over 1,000 wallets, the same million events cost 0.3 ms: the first ten candidates were ten heads.
+- **Every wallet pays for a backlog held by a few.** While fewer than ten heads can be taken, because fewer wallets hold the backlog than a batch takes or because most heads wait out their backoff after failed publications, every round of every publisher reads it whole.
+- **Draining such a backlog takes time quadratic in its size.** It goes one event per round, and each round reads what is left: by the measured cost, about 6 minutes for 10,000 events and 11 hours for 100,000, before the time spent publishing.
+- **Past about 540,000 events (on this machine), publication stops.** A claim then outlasts the 5-second statement timeout, every round fails, and no event of any wallet is published until `DATABASE_STATEMENT_TIMEOUT_MS` is raised. Nothing is lost: the events wait in the outbox.
+- **A hot wallet can get there.** A wallet whose events arrive faster than its rounds publish them keeps growing its backlog while its traffic lasts, faster as the rounds slow. At the load test's hot rate, about 140 events per second, it would take a little over an hour.
+
+A claim that visited one head per wallet with pending events, a skip scan over `outbox_messages_pending_idx` written as a recursive query, would cost per wallet instead of per event, and drain a hot wallet's backlog in linear time. It joins the follow-ups below.
+
 ## Not covered
 
 - **Throughput beyond one machine.** The ceiling measured here is this host's. A deployment with the replicas, the database and the load generator apart would move the knee and probably the bottleneck.
@@ -229,4 +251,4 @@ The correctness checks also went through two independent reviews. The first vers
 - **Failures under load.** Killing replicas, losing PostgreSQL or SQS mid-run: the concurrency and integration suites cover these for correctness, not for performance under load.
 - **The observability profile.** With it running, spans are exported to a collector on the same host, which costs CPU the reference run did not pay.
 - **The events themselves.** The load test checks that every outbox row was published, not what reached `wager-events.fifo`; the integration and concurrency suites check publication, order and deduplication.
-- **The outbox beyond saturation.** Three changes would raise the outbox's ceiling: dedicated outbox processes, publishing several events of a wallet per round (in order), and marking a round's events in one statement. All three are left as follow-ups.
+- **The outbox beyond saturation.** Four changes would raise the outbox's ceiling: dedicated outbox processes, publishing several events of a wallet per round (in order), marking a round's events in one statement, and a claim whose cost follows the wallets rather than the events ([above](#the-claim-behind-a-large-backlog)). All four are left as follow-ups.

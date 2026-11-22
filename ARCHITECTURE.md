@@ -118,7 +118,7 @@ stateDiagram-v2
   [*] --> PENDING
   PENDING --> PROCESSED: applied
   PENDING --> REJECTED: business rule broken
-  PENDING --> PENDING_REFERENCE: reference not found yet
+  PENDING --> PENDING_REFERENCE: reference missing or not settled
   PENDING --> FAILED: allowed by the model, never committed
   PENDING_REFERENCE --> PROCESSED: reference resolved and applied
   PENDING_REFERENCE --> REJECTED: rule broken, or TTL expired
@@ -181,6 +181,7 @@ The rules of §7 apply as written. These interpretations go beyond the statement
 4. **A rejection is final for its idempotency key.** Resending the same request replays the rejection; changing the payload under the same key is a conflict. A provider that corrects a payload must send it as a new transaction, with a new `externalTransactionId`.
 5. **A replay returns the original result,** including the balance observed when the transaction was applied (§7, rule 7), from a snapshot stored with the transaction, never from the current balance.
 6. **An initial balance of zero** opens the wallet without an `OPENING` transaction, as §9 implies.
+7. **A pending reference makes its dependants wait.** When a transaction references one that is itself still `PENDING_REFERENCE` (the `ROLLBACK` of a `REFUND` whose `BET` has not arrived), it is parked in `PENDING_REFERENCE` too, with its own 15-minute deadline. It proceeds once the reference is `PROCESSED`. It is `REJECTED` with `REFERENCE_NOT_PROCESSED` if the reference ends `REJECTED` or `FAILED`, or is still pending when its own deadline passes. The worker handles the oldest pending transactions first, so chains resolve in order. Rejecting such a reversal at once would let an out-of-order chain end wrong: the `ROLLBACK` rejected, then the `REFUND` applied, leaving the player with a credit the provider meant to undo.
 
 ### 5.1 Failure codes (§7.2)
 
@@ -193,7 +194,7 @@ Every rejection carries a stable, machine-readable `failureCode`. The codes are 
 | `REFERENCE_NOT_FOUND` | The reference did not arrive within the 15-minute TTL | Send the referenced transaction, then the reversal again under a new id. |
 | `REFERENCE_MISMATCH` | The reference belongs to another provider, player, wallet, currency or round | Fix the payload and send it under a new id. |
 | `REFERENCE_KIND_NOT_ALLOWED` | `REFUND` of anything but a `BET`; `ROLLBACK` of anything but a `BET`, `WIN` or `REFUND`; `WIN` referencing anything but a `BET` | Fix the payload and send it under a new id. |
-| `REFERENCE_NOT_PROCESSED` | The reference exists but ended `REJECTED` or `FAILED` | Final. |
+| `REFERENCE_NOT_PROCESSED` | The reference exists but ended `REJECTED` or `FAILED`, or was still `PENDING_REFERENCE` when this transaction's deadline passed | Final. |
 | `REFERENCE_ALREADY_REVERSED` | The reference already has a `PROCESSED` `REFUND` or `ROLLBACK` | Final: the money has already moved back. |
 | `AMOUNT_MISMATCH` | A reversal's amount differs from its reference's (partial reversals are out of scope, §7, rule 5) | Fix the payload and send it under a new id. |
 | `CURRENCY_MISMATCH` | The operation's currency differs from the wallet's | Fix the payload and send it under a new id. |
@@ -216,7 +217,7 @@ The unit of concurrency is the wallet.
 
 - **Pessimistic row lock.** Each use case starts by taking the wallet's row lock, `SELECT … FOR UPDATE` (`LockMode.PESSIMISTIC_WRITE`), before reading anything its decision depends on and before any other row lock. Work on one wallet is serialized; different wallets proceed in parallel.
 - **Isolation.** PostgreSQL's default `READ COMMITTED` is enough: the row lock, not the isolation level, serializes the work, and a locked read always sees the latest committed balance.
-- **Bounded waits.** `lock_timeout` turns a long wait into a transient error (503, or SQS redelivery) and increments the lock-conflict metric. There is no retry loop inside a request.
+- **Bounded waits.** A 2-second `lock_timeout` turns a long wait into a transient error (503 `WALLET_BUSY`, or SQS redelivery) and increments the lock-conflict metric. Each transaction holds the wallet lock for milliseconds, so 2 seconds absorb the queue of a contended wallet, such as the 50 parallel copies of one bet that §13 tests, and still answer within the timeouts providers typically allow a wallet call. There is no retry loop inside a request.
 - **Database guards.** `CHECK (balance >= 0)`, the uniqueness of `(wallet_id, wallet_version)` in the ledger and the other schema guarantees ([section 8](#8-persistence-and-transactional-strategy)) reject what a bug in the application might let through.
 - **No global lock.** There is no shared mutex, no constant-key advisory lock and no row updated by every transaction: that is why counter-account balances are derived ([section 4.4](#44-double-entry-ledger)).
 - **Several instances.** No correctness depends on process memory. Workers claim rows with `FOR UPDATE SKIP LOCKED`, and migrations run in a single one-shot job.
@@ -267,6 +268,7 @@ Uniqueness, immutability and non-negativity are enforced by PostgreSQL, not only
 - **Migrations** are MikroORM migrations whose SQL is reviewed by hand, and every one is reversible. A test applies all of them to an empty database, reverts them completely and applies them again, comparing a fingerprint of the schema catalog (relations, types, functions, triggers, constraints, extensions). A `down()` that forgets a trigger function fails it.
 - **Application processes never run DDL.** MikroORM's `ensureDatabase` is off: databases come from Compose or the test harness, and the schema only from migrations.
 - **Connections are bounded.** A 5-second connection timeout makes an unreachable database fail fast as a transient error. A 30-second `idle_in_transaction_session_timeout` lets PostgreSQL release the row locks of a process that stalled or vanished in the middle of a transaction.
+- **Statements are bounded too.** The application's sessions run with a 2-second `lock_timeout` ([section 7](#7-concurrency-8)) and a 5-second `statement_timeout`, which stops a runaway query, such as a large ledger page or a reconciliation, from holding a connection. Both are configurable, migrations run without them, and both are wired in together with the first use case.
 - **IDs are UUIDv7,** generated by the application behind an `IdGenerator` port. They are time-ordered, which keeps index inserts local, and they exist before the insert, so events and outbox rows can reference them inside the same transaction.
 
 ## 9. Messaging (§10, §11)
@@ -287,10 +289,11 @@ All three are FIFO queues with content-based deduplication off, so senders must 
 - It acknowledges (deletes) a message only after the SQL transaction commits. A crash between commit and acknowledgement means a redelivery, which the inbox and the idempotency key turn into a no-op.
 - Errors fall into three classes:
   - A business rejection is a final result, so the message is acknowledged.
-  - A transient error extends the visibility timeout with jittered exponential backoff.
+  - A transient error extends the visibility timeout with full-jitter exponential backoff: base 5 s, cap 60 s.
   - A permanent error (malformed message, unknown type, unknown wallet) goes straight to the DLQ.
 
-  The redrive policy caps all of it at 5 receives.
+  The redrive policy caps all of it at 5 receives, at most about 2 min 15 s of retries.
+- **It pauses during outages.** While PostgreSQL or SQS is unreachable, the consumer stops receiving and probes the dependency with backoff before resuming. Without this, an outage of a few minutes would use up the 5 receives of every message in flight and push healthy messages to the DLQ, where they would need a manual redrive. Per-message backoff is left for isolated failures, such as a lock timeout.
 - Producers are expected to use `walletId` as `MessageGroupId`, which preserves per-wallet order and parallelizes across wallets. Correctness does not depend on it.
 - On `SIGTERM` it stops polling, then finishes the messages in flight or returns their visibility. The queue's 20-second long poll is longer than the 10-second shutdown budget, so every receive gets an `AbortSignal` that shutdown aborts first.
 
@@ -298,6 +301,7 @@ All three are FIFO queues with content-based deduplication off, so senders must 
 
 - Events are written to the outbox inside the financial transaction, and nothing is published before the commit (§5, item 4).
 - Publishers on every instance claim due rows with `FOR UPDATE SKIP LOCKED`, so they never block each other. They publish to `wager-events.fifo` with `MessageGroupId = walletId` and `MessageDeduplicationId = eventId`, then mark the rows as published.
+- **Per-wallet order.** Only the oldest unpublished event of each wallet is eligible for publication, ordered by a database sequence assigned at insert, under the wallet lock. UUIDv7 cannot order events: it follows each instance's clock, which can disagree with the commit order. Concurrent publishers therefore never hold two events of the same wallet, and `wager-events.fifo` receives each wallet's events in commit order, which is what makes it worth being a FIFO queue. The cost is that an event that keeps failing holds back the later events of its wallet, and only of that wallet, until it is published. The 10-attempt gauge raises the alert.
 - If a process dies after the commit but before publishing, the rows stay pending and another instance publishes them.
 - Delivery is at-least-once. A publication repeated after a crash carries the same `eventId`, so SQS deduplicates it within its 5-minute window, and consumers deduplicate on `eventId` beyond it.
 - A failed publication reschedules the row; it is never dropped ([section 10](#10-retry-policies)).
@@ -313,8 +317,10 @@ Pacing and termination are separate concerns, and each retry needs both.
 |---|---|---|
 | `PENDING_REFERENCE` reprocessing (§7.1) | Full jitter, base 1 s, cap 60 s | TTL of 15 minutes, then `REJECTED` with `REFERENCE_NOT_FOUND` |
 | Outbox publishing (§11) | Full jitter, base 1 s, cap 60 s | None: retried until published |
-| Inbound message with a transient error (§10) | Full jitter on the visibility timeout | 5 receives, then the DLQ |
-| Wallet lock wait (§8) | No retry inside the request | `lock_timeout`: 503, or SQS redelivery |
+| Inbound message with a transient error (§10) | Full jitter on the visibility timeout, base 5 s, cap 60 s | 5 receives, then the DLQ (at most about 2 min 15 s) |
+| Wallet lock wait (§8) | No retry inside the request | 2-second `lock_timeout`: 503, or SQS redelivery |
+
+**The inbound window stays far inside the TTL.** Five receives at base 5 s and cap 60 s add up to at most about 2 min 15 s, so a `BET` being retried cannot outlive the reversal waiting for it in `PENDING_REFERENCE`. Outages are handled by pausing consumption ([section 9](#9-messaging-10-11)), not by longer delays, which would also slow down retries after a mere lock timeout.
 
 **Missing references end on a deadline, not an attempt count.** With full jitter, the number of attempts says nothing about elapsed time: 10 attempts take about 2.5 minutes on average, with no guaranteed minimum. The deadline is fixed when the transaction is first persisted: receipt plus 15 minutes. The last attempt is scheduled at the deadline, and rejection happens only on a real lookup made at or after it. A transaction is therefore never abandoned before its TTL, and never rejected without being looked up, even after the worker was down.
 
@@ -349,6 +355,8 @@ The TTL errs long on purpose. A reversal rejected before its `BET` arrives leave
 | Unknown wallet or transaction | 404 |
 | Idempotency conflict; duplicate wallet for the same player and currency | 409 |
 | Transaction `REJECTED` by a business rule (the body is the transaction, with `failureCode`) | 422 |
+| Body larger than the accepted limit | 413 |
+| Unexpected failure (a bug) | 500 |
 | Transient infrastructure failure, with `Retry-After` | 503 |
 
 §9 requires these situations to be distinguishable by status code alone, so a provider can decide whether to resend without parsing an error message:
@@ -357,7 +365,34 @@ The TTL errs long on purpose. A reversal rejected before its `BET` arrives leave
 - **Business rejections get their own status (422)**, with the stored transaction as the body. Answering 200 with a `REJECTED` status in the body, as many iGaming wallet APIs do, would force providers to parse the body to learn the outcome.
 - **503 means "resend with the same key".** Nothing was committed, so retrying is safe.
 
-Protocol errors use RFC 9457 `application/problem+json` bodies with a stable, machine-readable `code`, and the mapping is identical on every endpoint.
+### Protocol errors
+
+Every error that is not a business rejection is an RFC 9457 `application/problem+json` body, identical in shape on every endpoint:
+
+- `type` is `about:blank`, with `title`, `status`, `detail` and `instance` (the request path);
+- the extension member `code` carries a stable, machine-readable code, and `correlationId` ties the response to the logs;
+- `VALIDATION_FAILED` adds `errors: [{ path, message }]`, one entry per broken rule.
+
+Every 503 carries `Retry-After`. Resending any 5xx with the same idempotency key is safe: either nothing was committed, or the retry is answered as a replay. Like failure codes, these codes are a public contract.
+
+| Status | `code` | When |
+|---|---|---|
+| 400 | `MALFORMED_JSON` | The body is not valid JSON |
+| 400 | `VALIDATION_FAILED` | The payload or a header breaks the schema, including `kind: OPENING` |
+| 400 | `IDEMPOTENCY_KEY_REQUIRED` | The `Idempotency-Key` header is missing or blank |
+| 400 | `INVALID_CURSOR` | The ledger cursor was not issued by this service |
+| 404 | `WALLET_NOT_FOUND` | Unknown wallet |
+| 404 | `TRANSACTION_NOT_FOUND` | Unknown transaction |
+| 404 | `ROUTE_NOT_FOUND` | Unknown route |
+| 409 | `IDEMPOTENCY_CONFLICT` | Same idempotency key, different payload |
+| 409 | `EXTERNAL_TRANSACTION_CONFLICT` | Same `providerId` and `externalTransactionId` under another idempotency key |
+| 409 | `WALLET_ALREADY_EXISTS` | A wallet already exists for the player and currency |
+| 413 | `PAYLOAD_TOO_LARGE` | The body exceeds the accepted size |
+| 503 | `WALLET_BUSY` | `lock_timeout` while waiting for a contended wallet |
+| 503 | `DEPENDENCY_UNAVAILABLE` | PostgreSQL or SQS unreachable, or a statement timeout |
+| 500 | `UNEXPECTED_ERROR` | A bug |
+
+`WALLET_BUSY` and `DEPENDENCY_UNAVAILABLE` both mean "resend later with the same key"; they are distinct so that a contended wallet and an infrastructure incident can be told apart in metrics and support conversations.
 
 ### Ledger pagination
 
@@ -445,6 +480,8 @@ No user table or password hashing is ever built. Messages from the queue are a t
 - **Late references.** A reference arriving after its 15-minute TTL finds the reversal already rejected, and the provider must resend the reversal under a new id.
 - **Corrections.** A rejected transaction cannot be fixed under the same idempotency key.
 - **At-least-once events.** Consumers of `wager-events.fifo` must deduplicate on `eventId`.
+- **Outbox head-of-line blocking.** An event that keeps failing holds back the later events of its wallet until it is published.
+- **Long outages.** An outage longer than a reversal's TTL can expire it while its `BET` is still waiting in the inbound queue.
 - **LocalStack** requires an auth token to run the project, and keeps no state: if it restarts on its own, the queues are gone until `docker compose up` runs `provision` again.
 - **nginx** must be restarted after a change in the number of replicas.
 - **Metrics** are per process; reading them through the proxy gives a different replica's values each time.
@@ -454,10 +491,4 @@ No user table or password hashing is ever built. Messages from the queue are a t
 
 ## 17. Open points
 
-Not decided yet. Each is settled with the maintainer before the related code is written, and recorded here and in AGENTS.md.
-
-- **Event ordering.** Concurrent publishers using `SKIP LOCKED` can publish one wallet's events out of order. Either document it as a limitation (consumers order by `walletVersion`) or have publishers claim rows per wallet.
-- **Inbound backoff.** The base and cap of the inbound queue's visibility backoff are open. Constraint: the time a message can spend in retries before reaching the DLQ must stay below the `PENDING_REFERENCE` TTL, otherwise a reversal could be rejected while its `BET` is still being retried.
-- **Timeouts.** Values for `statement_timeout` and `lock_timeout`, to be set with the use cases.
-- **Problem codes.** The list of `code` values in problem+json responses.
-- **Pending reference of a reversal.** When a reversal references a transaction that is itself still `PENDING_REFERENCE`, it can either wait in `PENDING_REFERENCE` or be rejected with `REFERENCE_NOT_PROCESSED`.
+None right now. A decision that this document and the statement do not cover is listed here and settled with the maintainer before the related code is written, then recorded here and in AGENTS.md.

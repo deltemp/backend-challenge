@@ -186,7 +186,7 @@ export interface ConsumerConfig {
 export interface OutboxWorkerConfig {
   /** Events claimed per round, at most one per wallet. */
   readonly batchSize: number;
-  /** Wait after a round that found less than a full batch. */
+  /** Wait after a round that found nothing due; a round that published goes on at once. */
   readonly pollIntervalMs: number;
   /** Request timeout of the publisher's own SQS client, which makes a single attempt. */
   readonly publishTimeoutMs: number;

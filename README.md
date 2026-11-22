@@ -176,7 +176,7 @@ Environment variables, validated at boot. An invalid or missing value stops the 
 | `SQS_RECEIVE_BATCH_SIZE` | `10` | Messages per receive |
 | `SQS_RETRY_BASE_MS` / `SQS_RETRY_CAP_MS` | `5000` / `60000` | Full-jitter backoff, on the visibility timeout, of a message that failed transiently |
 | `OUTBOX_BATCH_SIZE` | `10` | Events claimed per publishing round, at most one per wallet; with `OUTBOX_PUBLISH_TIMEOUT_MS`, a round must fit within `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS` (checked at boot) |
-| `OUTBOX_POLL_INTERVAL_MS` | `500` | Wait after a publishing round that found less than a full batch |
+| `OUTBOX_POLL_INTERVAL_MS` | `500` | Wait after a publishing round that found nothing due; a round that published goes on at once |
 | `OUTBOX_PUBLISH_TIMEOUT_MS` | `5000` | Request timeout of the publisher's own SQS client |
 | `OUTBOX_ALERT_ATTEMPTS` | `10` | Failed attempts from which a pending event counts in the alert gauge |
 | `REFERENCE_RETRY_BATCH_SIZE` | `50` | Parked transactions taken per retry round |

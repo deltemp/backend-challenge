@@ -90,8 +90,10 @@ export class OutboxPublisherWorker
           await sleep(this.backoff.delayMs(failures - 1), signal);
         } else {
           failures = 0;
-          // A full batch means more may be due: go on at once.
-          if (result.claimed < batchSize) {
+          // Publishing an event makes the next event of its wallet due, so a round that
+          // published goes on at once, whatever its size: a backlog held by a few wallets
+          // drains as fast as one held by many. Only a round that found nothing due waits.
+          if (result.claimed === 0) {
             await sleep(pollIntervalMs, signal);
           }
         }

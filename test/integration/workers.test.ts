@@ -152,3 +152,81 @@ describe("background workers", () => {
     expect(event).toBeDefined();
   });
 });
+
+// A round takes one event per wallet, so a backlog held by a single wallet takes one round per
+// event. The publisher waits its poll interval only when a round found nothing due, so such a
+// backlog drains round after round instead of one event per interval.
+describe("the outbox publisher on a single wallet's backlog", () => {
+  const sqs = createTestSqsClient();
+  const apps: AppProcess[] = [];
+  let database: TestDatabase | undefined;
+  let queues: TestQueues | undefined;
+  let sql: SQL | undefined;
+
+  beforeAll(async () => {
+    database = await createTestDatabase();
+    queues = await createTestQueues(sqs);
+    sql = new SQL(database.url);
+  });
+
+  afterAll(() =>
+    cleanUp(
+      () => Promise.all(apps.map((app) => app.stop("SIGKILL"))),
+      () => sql?.close(),
+      () => queues?.delete(),
+      () => database?.drop(),
+      () => sqs.destroy(),
+    ),
+  );
+
+  afterEach(async () => {
+    if (sql !== undefined) {
+      expect(await ledgerDiscrepancies(sql)).toEqual([]);
+    }
+  });
+
+  test("publishing an event makes the next one of its wallet due: the backlog drains without waiting", async () => {
+    if (database === undefined || queues === undefined || sql === undefined) {
+      throw new Error("setup did not complete");
+    }
+    const api = await startApp({ ...appEnvironment(database, queues), APP_ROLES: "api" });
+    apps.push(api);
+    await api.waitUntilReady();
+    const wallet = await openWalletOverHttp(api.baseUrl, "100.00");
+    for (let bet = 0; bet < 10; bet += 1) {
+      const answer = await submitOverHttp(api.baseUrl, transactionCommand(wallet, { kind: "BET" }));
+      expect(answer.status).toBe(200);
+    }
+
+    // 22 events of one wallet: the opening's two and two per bet. Were the publisher to wait its
+    // poll interval after each partial round, they would take 105 seconds; a single failed
+    // publication still fits in the wait, rescheduled within one interval.
+    const publisher = await startApp({
+      ...appEnvironment(database, queues),
+      APP_ROLES: "outbox",
+      // Pinned above one: with a batch of one, each round here would be full, and the test
+      // could not tell the old pacing (wait after a partial round) from the new one.
+      OUTBOX_BATCH_SIZE: "10",
+      OUTBOX_POLL_INTERVAL_MS: "5000",
+    });
+    apps.push(publisher);
+    await publisher.waitUntilReady();
+
+    const messages = await takeMessages(
+      sqs,
+      queues.urls.wagerEvents,
+      22,
+      (message) => message.Attributes?.MessageGroupId === wallet.id,
+    );
+    expect(messages.map((message) => eventOf(message).data.walletVersion).filter(Boolean)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+    ]);
+    // A round marks its events published after SQS confirms them, then commits.
+    const db = sql;
+    await eventually("every event marked published", async () => {
+      const [row] = await db`
+        select count(*)::int as pending from outbox_messages where published_at is null`;
+      return row?.pending === 0 ? true : undefined;
+    });
+  });
+});

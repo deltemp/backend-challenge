@@ -8,7 +8,7 @@ Solution to Jungle Gaming's backend challenge, "Distributed Wagering Processor":
 
 - **Requirements:** `docs/CHALLENGE.md`, the original statement in Portuguese. Never edit or translate it. `§N` below refers to its sections.
 - **Decisions and rationale:** `ARCHITECTURE.md`, a required deliverable. It holds the reasoning behind the rules in this file; keep both in sync.
-- **Status: every mandatory requirement implemented, plus OpenTelemetry tracing.** The domain model (`src/domain`), the schema (migrations), the application layer (`src/application`) with its MikroORM and SQS adapters, and the interfaces that run it (`src/interfaces`: the wagering HTTP API, the SQS consumer, the outbox publisher and the reference retry worker, with the business metrics) exist and are tested, including the multi-process scenarios of §13. Tracing covers HTTP, the use cases, the SQL transactions, the outbox and SQS, with a Grafana dashboard in the `observability` Compose profile. Next, per "Scope and sequencing": the load test. Keep "Commands" and "Layout" in line with reality, in the same change that alters them.
+- **Status: every mandatory requirement implemented, plus OpenTelemetry tracing.** The domain model (`src/domain`), the schema (migrations), the application layer (`src/application`) with its MikroORM and SQS adapters, and the interfaces that run it (`src/interfaces`: the wagering HTTP API, the SQS consumer, the outbox publisher and the reference retry worker, with the business metrics) exist and are tested, including the multi-process scenarios of §13. Tracing covers HTTP, the use cases, the SQL transactions, the outbox and SQS, with a Grafana dashboard in the `observability` Compose profile, and `bun run test:load` runs the load test (`docs/LOAD-TEST.md` holds its method, a reference run and the analysis). Everything in "Scope and sequencing" is done. Keep "Commands" and "Layout" in line with reality, in the same change that alters them.
 
 ### What is graded (§14)
 
@@ -46,7 +46,7 @@ Final invariant, asserted at the end of every integration and concurrency test: 
 | Lint and format | Biome, zero warnings |
 | Logging / metrics / health | pino (JSON on stdout) / prom-client (`GET /metrics`) / `@nestjs/terminus` |
 | Tracing | OpenTelemetry (API 1.x, SDK 3.x), manual spans, OTLP over HTTP; grafana/otel-lgtm in the `observability` Compose profile |
-| Load test (deferred) | k6 in a container |
+| Load test | k6 in a container, driven by `scripts/load-test.ts` |
 | Local orchestration | Docker Compose; nginx in front of 3 replicas |
 
 Version policy: latest stable releases, pinned to exact versions in `package.json` and in Compose image tags. If a combination turns out to be incompatible, step back only the offending package and record why in `ARCHITECTURE.md`.
@@ -76,7 +76,8 @@ bun test --preload ./test/support/preload.ts ./test/integration/health.test.ts  
 bun run migration:create --blank --name=<name>     # new migration (drop --blank to diff the schema)
 bun run migration:up                               # apply pending migrations
 bun run migration:down                             # revert the last migration
-bun run test:load                                  # k6 smoke run; the real load test is deferred
+bun run test:load                                  # load test of the running stack (~5 min); report in test/load/results/
+bun run test:load --quick                          # the same, every phase shortened (~2 min)
 ```
 
 Integration and concurrency files must run with the preload (the package scripts pass it): it checks the infrastructure and builds the template database.
@@ -128,7 +129,9 @@ src/
     workers/         outbox publisher, reference retry worker
   app.module.ts      imports the module of each role in APP_ROLES
   main.ts            one entry point; JSON parser with a size limit, validation pipe
-scripts/             migrations.ts, provision.ts
+scripts/             migrations.ts, provision.ts; load-test.ts (drives the load test: environment,
+                     wallets, k6, sampling, drains, checks) and load-report.ts (its pure side:
+                     metrics parsing, quantiles, correctness checks, the Markdown report)
 test/
   support/           preload, per-file databases and queues, app processes, ledger invariant,
                      use-case harness (TestClock, command builders, deferred), HTTP, SQS and
@@ -139,7 +142,9 @@ test/
                      processes
   concurrency/       use-cases.test.ts in one process; instances.test.ts the §13 scenarios
                      with real processes
-  load/
+  load/              load.js (the k6 traffic: HTTP steps, queue, hot wallets); results/ (each
+                     run's plan, k6 summary and report, git-ignored)
+docs/                CHALLENGE.md (the statement), LOAD-TEST.md (load-test method and results)
 docker/nginx/        proxy configuration
 docker/otel-lgtm/    observability profile: Prometheus scrape job, Grafana provisioning and the
                      dashboard
@@ -185,6 +190,8 @@ Each of these cost time once. Do not rediscover them.
 - **Test instances never inherit `OTEL_*`** (`startApp` withholds them, like `MIKRO_ORM_*`); a test that wants tracing passes the endpoint itself. In-process unit tests that register a tracer provider must `trace.disable()`, `context.disable()` and `propagation.disable()` afterwards: the registration is global.
 - **The outbox claim needs `outbox_messages_unpublished_sequence_idx`** (a partial index on `sequence_number` where `published_at is null`). Published rows are never purged; without that index the claim's `order by sequence_number` walked the unique index through every event ever published, 240 ms per round after 187,000 events. Keep any new outbox query on unpublished rows index-backed, and check with `EXPLAIN (ANALYZE, BUFFERS)`, also under stale statistics (`analyze` with nothing pending, then insert a backlog in the same transaction). The claim finds each wallet's head with a scalar subquery (`sequence_number = (select min(...) …)`), not `NOT EXISTS`: as an anti-join its plan followed the statistics, and right after a burst it scanned the whole backlog for each candidate. Keep `o.published_at is null` in the claim although `next_attempt_at <= ?` implies it through `outbox_messages_schedule_check`: the planner matches a partial index only against the query's own conditions, and no test pins the plan.
 - **nginx must drop idle upstream connections before the replicas do** (`keepalive_timeout 4s` in the upstream; Bun's node:http keep-alive is 5 seconds). Otherwise a request sent on a connection the replica is closing gets a reset and nginx answers 502, without retrying a POST.
+- **The load test compares k6's counts with the database and the replicas' counters exactly.** Run it on a stack with no other traffic; a replica that restarts mid-run fails the run (its counters start over). Replicas publish no port, so `scripts/load-test.ts` reads each one's `/metrics` with `docker exec <container> bun -e …`. On Linux and macOS it runs the k6 container as the current user (`--user`), or k6 could not write its summary into `test/load/results/`.
+- **k6 calls LocalStack's SQS without a signature** (the JSON protocol, `X-Amz-Target: AmazonSQS.SendMessage`), which LocalStack accepts; against AWS that would need SigV4. The wait of each queue message comes from the inbox afterwards: its message id carries the send time and `inbox_messages.received_at` the processing time, both from the same Docker host's clock.
 - **The observability profile replaces the image's `prometheus.yaml`** (`docker/otel-lgtm/prometheus.yaml`) to add the scrape job. When upgrading grafana/otel-lgtm, compare it with the image's own file (`/otel-lgtm/prometheus.yaml`). Grafana there runs with anonymous admin access, the image's default: local use only.
 
 ## Domain modeling (§6)
@@ -362,11 +369,21 @@ Pacing and termination are separate concerns. Pacing spreads retries, so that a 
 - Tests must be deterministic. Do not fix a race with `sleep`, retries or a longer timeout; wait on an observable condition.
 - Never weaken, skip or delete a failing test to get a green run. A failing invariant test is a finding to report.
 - The mandatory scenario of §8 must exist as a concurrency test: balance `100.00`, two concurrent `80.00` bets, exactly one `PROCESSED`, the other `REJECTED` for insufficient funds, final balance `20.00`, exactly one debit entry.
+- **The load test** (`bun run test:load`, decided with the maintainer) runs against the compose stack, never the per-file harness. k6 (`test/load/load.js`) only generates traffic and counts what it sees; `scripts/load-test.ts` opens the wallets, samples `outbox_lag_seconds`, `outbox_pending_events` and the inbound queue's depth every second, waits for both to drain, reconciles every wallet over the API, reads each replica's counters before, at every phase end and after, and measures each queue message's wait from the inbox. Phases run one after another: warm-up, the queue (while the system is calm), HTTP steps at constant arrival rates (an open model), then the hot wallets. The exit code fails only on correctness:
+  - no 5xx other than 503 and no unexpected answer;
+  - the run's transactions counted in the database by status exactly equal to what k6 saw decided, plus the transactions of unknown outcome (an answer lost, or a dependency lost while one may have committed) that the database turns out to hold: k6 logs each one and the script looks it up;
+  - the replicas' counters equal to the database, a transaction that met `DEPENDENCY_UNAVAILABLE` allowing one uncounted row;
+  - every queue message stored once with its inbox row (sends of unknown outcome looked up likewise), and the consumers' counter short of the database only by redelivered messages;
+  - replays and the two halves of a race answering the same stored outcome (status, failure code, balance);
+  - no dead letter (the consumers' counter and the DLQ's depth);
+  - every balance equal to its ledger;
+  - the queue and the outbox drained (read from SQS and the database, not from a gauge);
+  - no replica restarted (`process_start_time_seconds` unchanged). Latency is reported, not judged: the statement sets no target. Money stays a string there too (a fixed table of stakes). `docs/LOAD-TEST.md` holds the method and a reference run; update it when the method or the system's behaviour under load changes.
 
 ## Scope and sequencing
 
 1. Mandatory requirements first, with the double-entry ledger designed into the first migration.
-2. Once every mandatory requirement and its tests were green: OpenTelemetry tracing (done: manual spans from HTTP through the use case, the SQL transaction, the outbox and SQS, with trace context propagated in messages, and a Grafana dashboard in the `observability` Compose profile), and then the load test (`bun run test:load`, reporting environment, methodology, throughput, p50/p95/p99, error rate, concurrency conflicts and outbox lag).
+2. Once every mandatory requirement and its tests were green: OpenTelemetry tracing (done: manual spans from HTTP through the use case, the SQL transaction, the outbox and SQS, with trace context propagated in messages, and a Grafana dashboard in the `observability` Compose profile), and then the load test (done: `bun run test:load`, reporting environment, methodology, throughput, p50/p95/p99, error rate, concurrency conflicts and outbox lag; see `docs/LOAD-TEST.md`).
 3. Not planned: a second SQS emulator, an identity provider, CI pipelines. Ask before adding any of them.
 
 ## Secrets and environment

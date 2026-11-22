@@ -5,6 +5,8 @@ node_modules/
 dist/
 coverage/
 *.tsbuildinfo
+# Load-test plans, k6 summaries and reports of each run (docs/LOAD-TEST.md keeps the reference)
+test/load/results/
 
 # Environment files hold secrets (LOCALSTACK_AUTH_TOKEN). Only the example is committed.
 .env

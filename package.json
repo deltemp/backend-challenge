@@ -16,7 +16,7 @@
     "test:unit": "bun test ./test/unit",
     "test:integration": "bun test --preload ./test/support/preload.ts --timeout 60000 ./test/integration",
     "test:concurrency": "bun test --preload ./test/support/preload.ts --timeout 120000 ./test/concurrency",
-    "test:load": "docker compose --profile load run --rm k6",
+    "test:load": "bun scripts/load-test.ts",
     "migration:create": "bun scripts/migrations.ts create",
     "migration:up": "bun scripts/migrations.ts up",
     "migration:down": "bun scripts/migrations.ts down",

@@ -143,15 +143,18 @@ services:
       retries: 24
       start_period: 10s
 
-  # Load test runner, outside the default stack: bun run test:load
+  # Load-test traffic, outside the default stack. Run it with `bun run test:load`, which prepares
+  # test/load/results/plan.json, samples the stack meanwhile and writes the report.
   k6:
     image: grafana/k6:2.4.0
     profiles: ["load"]
-    command: ["run", "/scripts/smoke.js"]
+    command: ["run", "/scripts/load.js"]
     environment:
       BASE_URL: http://proxy
+      SQS_ENDPOINT: http://localstack:4566
     volumes:
       - ./test/load:/scripts:ro
+      - ./test/load/results:/results
     depends_on:
       proxy:
         condition: service_healthy

@@ -4,7 +4,7 @@ Solution to Jungle Gaming's backend technical challenge: a distributed financial
 
 The original challenge statement (in Portuguese) is kept verbatim in [docs/CHALLENGE.md](docs/CHALLENGE.md).
 
-> **Status:** every mandatory requirement is implemented and tested: the wagering HTTP API, the SQS consumer, the outbox publisher and the reference retry worker, on top of the domain model (wallets, transactions and their rules, the double-entry ledger, inbox and outbox), the database schema and the use cases. Three replicas run every role behind a proxy. OpenTelemetry tracing follows each transaction from HTTP or the queue through the use case and its SQL transaction to the events it publishes, with a Grafana dashboard in an optional Compose profile. The full load test comes next.
+> **Status:** every mandatory requirement is implemented and tested: the wagering HTTP API, the SQS consumer, the outbox publisher and the reference retry worker, on top of the domain model (wallets, transactions and their rules, the double-entry ledger, inbox and outbox), the database schema and the use cases. Three replicas run every role behind a proxy. OpenTelemetry tracing follows each transaction from HTTP or the queue through the use case and its SQL transaction to the events it publishes, with a Grafana dashboard in an optional Compose profile. `bun run test:load` runs a load test; its method, a reference run and its analysis are in [docs/LOAD-TEST.md](docs/LOAD-TEST.md).
 
 ## Stack
 
@@ -72,7 +72,7 @@ bun run dev
 | `bun run test:unit` | Unit tests; no containers needed |
 | `bun run test:integration` | Integration tests against real PostgreSQL and LocalStack |
 | `bun run test:concurrency` | Multi-instance tests with real processes |
-| `bun run test:load` | k6 smoke run through the proxy (the full load test comes later) |
+| `bun run test:load` | Load test of the running stack, about 5 minutes (`--quick`: about 2); see [Load test](#load-test) |
 | `bun run provision` | Apply migrations and create the queues |
 | `bun run migration:create` | New migration from the schema diff; `--blank` for a hand-written one, `--name=<name>` to name it |
 | `bun run migration:up` | Apply pending migrations |
@@ -95,6 +95,31 @@ bun test ./test/unit/config.test.ts                                   # one file
 bun test ./test/unit -t "rejects an unknown role"                     # one test by name
 bun test --preload ./test/support/preload.ts ./test/integration/health.test.ts
 ```
+
+### Load test
+
+```sh
+docker compose up -d --build --wait
+bun run test:load            # about 5 minutes
+bun run test:load --quick    # about 2 minutes, every phase shortened
+```
+
+k6 runs in its compose container (the `load` profile). After a warm-up it sends messages to `wager-transactions.fifo`, then betting rounds over HTTP in rising steps, then concurrent bets on a few hot wallets. Meanwhile the script samples the outbox and the queue. Afterwards it waits for both to drain, reconciles every wallet it used and compares k6's counts with the database and the replicas' counters. The report lands in `test/load/results/report-<run>.md`: throughput and latency percentiles per phase, errors, lock conflicts, queue waits, outbox lag and the correctness checks. The command exits with 1 only when a correctness check fails; latency is reported, not judged. Run it on a stack with no other traffic, since the counts are compared exactly.
+
+Settings are environment variables (in PowerShell, `$env:LOAD_STEPS = "50,100"` before the command):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LOAD_STEPS` | `25,50,100,150,200` | Betting rounds per second of each HTTP step |
+| `LOAD_STEP_SECONDS` / `LOAD_WARMUP_SECONDS` | `30` / `15` | Length of each step and of the warm-up before them |
+| `LOAD_QUEUE_RATE` / `LOAD_QUEUE_SECONDS` | `50` / `45` | Rounds per second sent as messages, two messages each, and for how long |
+| `LOAD_HOT_VUS` / `LOAD_HOT_WALLETS` / `LOAD_HOT_SECONDS` | `20` / `2` / `15` | Users betting without pause on a few wallets, and for how long |
+| `LOAD_WALLETS` / `LOAD_QUEUE_WALLETS` | `1000` / `200` | Wallets opened for the HTTP and the queue rounds |
+| `LOAD_DRAIN_TIMEOUT_SECONDS` | `900` | Longest wait for the queue and the outbox to drain |
+
+[docs/LOAD-TEST.md](docs/LOAD-TEST.md) describes the method and analyses a reference run.
+
+### Graceful shutdown
 
 On Windows a process cannot catch SIGTERM, so graceful shutdown is tested in a Linux container: `test/integration/graceful-shutdown.test.ts` builds the image from the current sources (`wagering-app:test`), runs a consumer on the compose network (`wagering_default`) and stops it with `docker stop`.
 

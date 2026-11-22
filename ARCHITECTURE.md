@@ -4,7 +4,7 @@ This document records the architectural decisions of the Distributed Wagering Pr
 
 ## Implementation status
 
-Every mandatory requirement is implemented, and so is tracing; the full load test comes next:
+Every mandatory requirement is implemented, and so are tracing and the load test:
 
 | Area | Status |
 |---|---|
@@ -19,7 +19,7 @@ Every mandatory requirement is implemented, and so is tracing; the full load tes
 | Wagering HTTP API, with RFC 9457 error responses | Implemented, tested over HTTP on a real process |
 | SQS consumer, outbox publisher, reference retry worker, business metrics | Implemented, tested with real processes, including the multi-process scenarios of §13 |
 | OpenTelemetry tracing (HTTP, use cases, SQL transactions, outbox, SQS) and the Grafana dashboard | Implemented, tested with a real process exporting to an OTLP receiver |
-| Load test | A smoke run (the k6 wiring exists); the full test comes next |
+| Load test (`bun run test:load`) | Implemented; method, a reference run and its analysis in [docs/LOAD-TEST.md](docs/LOAD-TEST.md) |
 
 ## 1. Overview
 
@@ -508,7 +508,7 @@ No user table or password hashing is ever built. Messages from the queue are a t
 | `provision` | One-shot job: applies migrations and creates the queues, then exits |
 | `app` × 3 | Starts only after `provision` succeeds; healthy only when ready; restarted unless stopped |
 | `proxy` | nginx on port 3000, in front of the replicas |
-| `k6` | Load-test runner, under the `load` profile |
+| `k6` | Load-test traffic, under the `load` profile; `bun run test:load` drives it |
 | `otel-lgtm` | Under the `observability` profile: an OpenTelemetry Collector, Tempo, Prometheus and Grafana (port 3001) in one container ([section 14](#14-observability-12)) |
 
 - **Migrations run once.** Running them in a one-shot job means replicas never race to migrate, and application processes never run DDL.
@@ -571,7 +571,12 @@ No user table or password hashing is ever built. Messages from the queue are a t
 - **Use cases are tested against the real infrastructure.** Each integration file opens the use cases on a database of its own, with the application's session timeouts, and publishes to LocalStack. A controllable clock and a fixed random value make deadlines and backoff exact, and a wrapped unit of work injects the faults that drive a transaction to `FAILED`.
 - **Concurrency at the use-case level.** `test/concurrency/use-cases.test.ts` runs the §8 scenario, the same bet 50 times in parallel, distinct wallets in parallel, a reversal racing its reference and the retry worker, and two publishers over one outbox. Each call is its own SQL transaction on its own connection, so PostgreSQL sees real concurrency; the multi-process versions above complete it.
 - **Unit tests follow §13.** `test/unit/domain` covers `Money`, the `Wallet` invariants, the rules of each kind (including precedence, pending references and chains), currency conflicts and the payload hash with independently computed SHA-256 vectors. Time and randomness are fixed values, so backoff and deadlines are exact.
-- **Load test.** `bun run test:load` runs k6 through the proxy; today it is a smoke run. The real load test, reporting environment, methodology, throughput, p50/p95/p99, error rate, concurrency conflicts and outbox lag, comes after the mandatory scope.
+- **Load test.** `bun run test:load` measures the compose stack with k6 and judges only correctness under load. Phases run one after another:
+  1. messages on the queue, while the system is calm;
+  2. HTTP rounds at rising constant arrival rates (an open model, so a slow server cannot hide its latency by slowing the arrivals);
+  3. concurrent bets on two hot wallets.
+
+  Afterwards every wallet is reconciled, and the run's transactions are counted in the database. Their counts must equal what k6 saw decided, once each transaction of unknown outcome has been looked up, and must equal the replicas' counters: each transaction and each message processed exactly once. [docs/LOAD-TEST.md](docs/LOAD-TEST.md) records the environment, the method, a reference run and what it shows. The first runs exposed the publisher pacing described in [section 9](#9-messaging-10-11).
 
 ## 16. Trade-offs and known limitations
 
@@ -582,7 +587,7 @@ No user table or password hashing is ever built. Messages from the queue are a t
 - **At-least-once events.** Consumers of `wager-events.fifo` must deduplicate on `eventId`.
 - **Outbox head-of-line blocking.** An event that keeps failing holds back the later events of its wallet until it is published.
 - **Published events are kept.** The outbox never purges published rows, although the schema allows it. Since the claim reads only unpublished rows through a partial index, the history no longer slows publication, but the table grows with every event.
-- **Outbox throughput per wallet.** A publication round takes one event per wallet, so a wallet's backlog drains at one event per round; the publisher loop runs rounds back to back while there is work.
+- **Outbox throughput per wallet.** A publication round takes one event per wallet, so a wallet's backlog drains at one event per round, and the rounds of one wallet run one after another (a concurrent round skips its locked head). A wallet whose transactions produce events faster than that, such as a hot wallet, builds a backlog that drains once its traffic calms down; [docs/LOAD-TEST.md](docs/LOAD-TEST.md) measures both rates. Publishing several events of a wallet per round, in order, would lift the limit, at the cost of handling a batch whose middle entry fails.
 - **Publishing inside a transaction.** The publisher holds its row locks during the SQS call. A call that outlasts the 30-second idle-in-transaction limit makes PostgreSQL end the session: the round rolls back and its events stay pending for another round, which is safe, only slower. The publisher's own SQS client, with a 5-second timeout and a single attempt, keeps that from happening, and `loadConfig` refuses settings under which a round's calls could add up past the limit.
 - **Dead-letter copies.** A crash between the copy to the DLQ and the delete of the original leaves a duplicate in the DLQ after the five-minute deduplication window. A dead letter keeps at most nine of the original message attributes, next to its reason (SQS allows ten).
 - **A crash after the commit.** A consumer killed between commit and acknowledgement holds its messages until their visibility timeout (30 s) ends; only then are they redelivered and answered from the inbox.

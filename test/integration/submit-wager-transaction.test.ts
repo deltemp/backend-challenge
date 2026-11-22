@@ -317,6 +317,8 @@ describe("SubmitWagerTransaction", () => {
       { roundId: "round\u0000-1" },
       // UTF-8 would store an unpaired surrogate as U+FFFD, merging distinct ids into one.
       { idempotencyKey: "key-\ud800" },
+      // SQS refuses U+FFFF in a message, so its events could never be published.
+      { gameId: "game-\uFFFF" },
       // The canonical form only: an uppercase id would find the row, then differ from it.
       { walletId: wallet.id.toUpperCase() },
     ]) {

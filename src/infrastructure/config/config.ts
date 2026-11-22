@@ -1,5 +1,6 @@
 import { z } from "zod";
-import type { WageringSettings } from "../../application/policies";
+import type { BackoffSettings, WageringSettings } from "../../application/policies";
+import { SQS_CONNECTION_TIMEOUT_MS, SQS_MAX_BATCH_ENTRIES } from "../sqs/limits";
 
 export const APP_ROLES = ["api", "consumer", "outbox", "retry"] as const;
 export type AppRole = (typeof APP_ROLES)[number];
@@ -51,11 +52,28 @@ const environmentSchema = z
     SQS_WAGER_TRANSACTIONS_DLQ: fifoQueueName.default("wager-transactions-dlq.fifo"),
     SQS_WAGER_EVENTS_QUEUE: fifoQueueName.default("wager-events.fifo"),
     SQS_MAX_RECEIVE_COUNT: integer(1, 1000).default(5),
+    HTTP_BODY_LIMIT_BYTES: integer(1024, 1_048_576).default(16_384),
+    SQS_RECEIVE_WAIT_SECONDS: integer(0, 20).default(20),
+    SQS_VISIBILITY_TIMEOUT_SECONDS: integer(1, 43_200).default(30),
+    SQS_RECEIVE_BATCH_SIZE: integer(1, 10).default(10),
+    SQS_RETRY_BASE_MS: integer(1, 3_600_000).default(5000),
+    SQS_RETRY_CAP_MS: integer(1, 3_600_000).default(60_000),
+    OUTBOX_BATCH_SIZE: integer(1, 100).default(10),
+    OUTBOX_POLL_INTERVAL_MS: integer(10, 60_000).default(500),
+    OUTBOX_PUBLISH_TIMEOUT_MS: integer(100, 60_000).default(5000),
+    OUTBOX_ALERT_ATTEMPTS: integer(1, 1_000_000).default(10),
+    REFERENCE_RETRY_BATCH_SIZE: integer(1, 1000).default(50),
+    REFERENCE_RETRY_POLL_INTERVAL_MS: integer(10, 60_000).default(1000),
+    OUTAGE_BACKOFF_BASE_MS: integer(1, 3_600_000).default(1000),
+    OUTAGE_BACKOFF_CAP_MS: integer(1, 3_600_000).default(30_000),
+    TEST_CONSUMER_ACK_DELAY_MS: integer(0, 60_000).default(0),
   })
   .superRefine((env, context) => {
     const backoffs = [
       ["REFERENCE_RETRY_BASE_MS", "REFERENCE_RETRY_CAP_MS"],
       ["OUTBOX_RETRY_BASE_MS", "OUTBOX_RETRY_CAP_MS"],
+      ["SQS_RETRY_BASE_MS", "SQS_RETRY_CAP_MS"],
+      ["OUTAGE_BACKOFF_BASE_MS", "OUTAGE_BACKOFF_CAP_MS"],
     ] as const;
     for (const [base, cap] of backoffs) {
       if (env[cap] < env[base]) {
@@ -69,6 +87,39 @@ const environmentSchema = z
         code: "custom",
         path: ["DATABASE_LOCK_TIMEOUT_MS"],
         message: "must be below DATABASE_STATEMENT_TIMEOUT_MS",
+      });
+    }
+    // A message that met an outage keeps the visibility timeout of its receive, so no long poll
+    // opened before the outage can return it again: the timeout must outlast the long poll.
+    if (env.SQS_VISIBILITY_TIMEOUT_SECONDS <= env.SQS_RECEIVE_WAIT_SECONDS) {
+      context.addIssue({
+        code: "custom",
+        path: ["SQS_VISIBILITY_TIMEOUT_SECONDS"],
+        message: "must be above SQS_RECEIVE_WAIT_SECONDS",
+      });
+    }
+    // A publishing round keeps its SQL transaction open across its SendMessageBatch calls, one
+    // per ten events, each bounded by the publish timeout plus the connection timeout. Past the
+    // idle-in-transaction limit PostgreSQL would end the session mid-round, every round.
+    const publishCalls = Math.ceil(env.OUTBOX_BATCH_SIZE / SQS_MAX_BATCH_ENTRIES);
+    if (
+      publishCalls * (env.OUTBOX_PUBLISH_TIMEOUT_MS + SQS_CONNECTION_TIMEOUT_MS) >=
+      env.DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["OUTBOX_PUBLISH_TIMEOUT_MS"],
+        message:
+          "with OUTBOX_BATCH_SIZE, a publishing round could outlast DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+      });
+    }
+    // A test seam: holding a message between its commit and its acknowledgement lets a test kill
+    // the process at that exact point. It has no place anywhere else.
+    if (env.TEST_CONSUMER_ACK_DELAY_MS > 0 && env.NODE_ENV !== "test") {
+      context.addIssue({
+        code: "custom",
+        path: ["TEST_CONSUMER_ACK_DELAY_MS"],
+        message: "is only accepted with NODE_ENV=test",
       });
     }
   });
@@ -109,6 +160,40 @@ export interface SqsConfig {
   readonly maxReceiveCount: number;
 }
 
+export interface HttpConfig {
+  /** Larger bodies are refused with 413 before any parsing. */
+  readonly bodyLimitBytes: number;
+}
+
+export interface ConsumerConfig {
+  /** Long poll of each receive; shutdown aborts it. */
+  readonly receiveWaitSeconds: number;
+  /** Set on each receive; it must outlast the processing of a message. */
+  readonly visibilityTimeoutSeconds: number;
+  readonly batchSize: number;
+  /** Pacing of a message that failed transiently, applied to its visibility timeout. */
+  readonly retry: BackoffSettings;
+  /** Test seam (NODE_ENV=test only): a pause between the commit and the acknowledgement. */
+  readonly ackDelayMs: number;
+}
+
+export interface OutboxWorkerConfig {
+  /** Events claimed per round, at most one per wallet. */
+  readonly batchSize: number;
+  /** Wait after a round that found less than a full batch. */
+  readonly pollIntervalMs: number;
+  /** Request timeout of the publisher's own SQS client, which makes a single attempt. */
+  readonly publishTimeoutMs: number;
+  /** Attempts from which a pending event counts in the alert gauge. */
+  readonly alertAttempts: number;
+}
+
+export interface ReferenceRetryWorkerConfig {
+  readonly batchSize: number;
+  /** Wait after a round with nothing due, or that only met busy wallets. */
+  readonly pollIntervalMs: number;
+}
+
 export interface AppConfig {
   readonly nodeEnv: "development" | "test" | "production";
   readonly port: number;
@@ -120,6 +205,12 @@ export interface AppConfig {
   readonly aws: AwsConfig;
   readonly sqs: SqsConfig;
   readonly wagering: WageringSettings;
+  readonly http: HttpConfig;
+  readonly consumer: ConsumerConfig;
+  readonly outbox: OutboxWorkerConfig;
+  readonly referenceRetry: ReferenceRetryWorkerConfig;
+  /** Pacing of the background loops while PostgreSQL or SQS is unavailable. */
+  readonly outageBackoff: BackoffSettings;
 }
 
 /** Invalid configuration. The message names each variable and the rule it breaks, never its value. */
@@ -196,5 +287,24 @@ export function loadConfig(environment: Readonly<Record<string, string | undefin
       referenceRetry: { baseMs: env.REFERENCE_RETRY_BASE_MS, capMs: env.REFERENCE_RETRY_CAP_MS },
       outboxRetry: { baseMs: env.OUTBOX_RETRY_BASE_MS, capMs: env.OUTBOX_RETRY_CAP_MS },
     },
+    http: { bodyLimitBytes: env.HTTP_BODY_LIMIT_BYTES },
+    consumer: {
+      receiveWaitSeconds: env.SQS_RECEIVE_WAIT_SECONDS,
+      visibilityTimeoutSeconds: env.SQS_VISIBILITY_TIMEOUT_SECONDS,
+      batchSize: env.SQS_RECEIVE_BATCH_SIZE,
+      retry: { baseMs: env.SQS_RETRY_BASE_MS, capMs: env.SQS_RETRY_CAP_MS },
+      ackDelayMs: env.TEST_CONSUMER_ACK_DELAY_MS,
+    },
+    outbox: {
+      batchSize: env.OUTBOX_BATCH_SIZE,
+      pollIntervalMs: env.OUTBOX_POLL_INTERVAL_MS,
+      publishTimeoutMs: env.OUTBOX_PUBLISH_TIMEOUT_MS,
+      alertAttempts: env.OUTBOX_ALERT_ATTEMPTS,
+    },
+    referenceRetry: {
+      batchSize: env.REFERENCE_RETRY_BATCH_SIZE,
+      pollIntervalMs: env.REFERENCE_RETRY_POLL_INTERVAL_MS,
+    },
+    outageBackoff: { baseMs: env.OUTAGE_BACKOFF_BASE_MS, capMs: env.OUTAGE_BACKOFF_CAP_MS },
   };
 }

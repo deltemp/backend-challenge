@@ -42,6 +42,87 @@ describe("loadConfig", () => {
       referenceRetry: { baseMs: 1000, capMs: 60_000 },
       outboxRetry: { baseMs: 1000, capMs: 60_000 },
     });
+    expect(config.http).toEqual({ bodyLimitBytes: 16_384 });
+    expect(config.consumer).toEqual({
+      receiveWaitSeconds: 20,
+      visibilityTimeoutSeconds: 30,
+      batchSize: 10,
+      retry: { baseMs: 5000, capMs: 60_000 },
+      ackDelayMs: 0,
+    });
+    expect(config.outbox).toEqual({
+      batchSize: 10,
+      pollIntervalMs: 500,
+      publishTimeoutMs: 5000,
+      alertAttempts: 10,
+    });
+    expect(config.referenceRetry).toEqual({ batchSize: 50, pollIntervalMs: 1000 });
+    expect(config.outageBackoff).toEqual({ baseMs: 1000, capMs: 30_000 });
+  });
+
+  test("rejects a consumer or outage backoff cap below its base", () => {
+    const message = configError({
+      ...MINIMAL,
+      SQS_RETRY_BASE_MS: "5000",
+      SQS_RETRY_CAP_MS: "1000",
+      OUTAGE_BACKOFF_BASE_MS: "2000",
+      OUTAGE_BACKOFF_CAP_MS: "1000",
+    }).message;
+
+    expect(message).toContain("SQS_RETRY_CAP_MS");
+    expect(message).toContain("OUTAGE_BACKOFF_CAP_MS");
+  });
+
+  test("accepts the acknowledgement delay, a test seam, only under NODE_ENV=test", () => {
+    expect(configError({ ...MINIMAL, TEST_CONSUMER_ACK_DELAY_MS: "1000" }).message).toContain(
+      "TEST_CONSUMER_ACK_DELAY_MS",
+    );
+    expect(
+      configError({ ...MINIMAL, NODE_ENV: "production", TEST_CONSUMER_ACK_DELAY_MS: "1000" })
+        .message,
+    ).toContain("TEST_CONSUMER_ACK_DELAY_MS");
+    expect(
+      loadConfig({ ...MINIMAL, NODE_ENV: "test", TEST_CONSUMER_ACK_DELAY_MS: "1000" }).consumer
+        .ackDelayMs,
+    ).toBe(1000);
+  });
+
+  test("refuses an outbox round that could outlast the idle-in-transaction limit", () => {
+    // Ten SendMessageBatch calls of up to 5 s plus a 3 s connection each: 80 s against 30 s.
+    expect(configError({ ...MINIMAL, OUTBOX_BATCH_SIZE: "100" }).message).toContain(
+      "OUTBOX_PUBLISH_TIMEOUT_MS",
+    );
+    expect(
+      loadConfig({
+        ...MINIMAL,
+        OUTBOX_BATCH_SIZE: "100",
+        OUTBOX_PUBLISH_TIMEOUT_MS: "1000",
+        DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS: "60000",
+      }).outbox.batchSize,
+    ).toBe(100);
+  });
+
+  test("requires the visibility timeout to outlast the long poll", () => {
+    expect(
+      configError({
+        ...MINIMAL,
+        SQS_RECEIVE_WAIT_SECONDS: "20",
+        SQS_VISIBILITY_TIMEOUT_SECONDS: "20",
+      }).message,
+    ).toContain("SQS_VISIBILITY_TIMEOUT_SECONDS");
+    expect(
+      loadConfig({
+        ...MINIMAL,
+        SQS_RECEIVE_WAIT_SECONDS: "1",
+        SQS_VISIBILITY_TIMEOUT_SECONDS: "2",
+      }).consumer.visibilityTimeoutSeconds,
+    ).toBe(2);
+  });
+
+  test("bounds a receive's long poll by the 20 seconds SQS allows", () => {
+    expect(configError({ ...MINIMAL, SQS_RECEIVE_WAIT_SECONDS: "21" }).message).toContain(
+      "SQS_RECEIVE_WAIT_SECONDS",
+    );
   });
 
   test("rejects a lock timeout that is not below the statement timeout", () => {

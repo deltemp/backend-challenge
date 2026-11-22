@@ -4,7 +4,7 @@ Solution to Jungle Gaming's backend technical challenge: a distributed financial
 
 The original challenge statement (in Portuguese) is kept verbatim in [docs/CHALLENGE.md](docs/CHALLENGE.md).
 
-> **Status:** the foundation is in place: configuration, structured logs, metrics, health checks, database migrations, SQS queue provisioning, three replicas behind a proxy, and the test harness. The domain model (wallets, transactions and their rules, the double-entry ledger, inbox and outbox), the database schema and the use cases with their repositories (wallets, transactions, queries, reconciliation, reference retries and outbox publishing) are implemented and tested. The wagering HTTP API, the SQS consumer loop and the background worker loops that run them are not implemented yet.
+> **Status:** every mandatory requirement is implemented and tested: the wagering HTTP API, the SQS consumer, the outbox publisher and the reference retry worker, on top of the domain model (wallets, transactions and their rules, the double-entry ledger, inbox and outbox), the database schema and the use cases. Three replicas run every role behind a proxy. OpenTelemetry tracing and the full load test come next.
 
 ## Stack
 
@@ -87,7 +87,7 @@ bun run test:integration
 bun run test:concurrency
 ```
 
-Each test file gets its own database, cloned in a fraction of a second from a template migrated once per run, and its own SQS queues. Application instances are started as real processes from the current sources, so no image rebuild is needed. Nothing is mocked: PostgreSQL and SQS are always real.
+Each test file gets its own database, cloned in a fraction of a second from a template migrated once per run, and its own SQS queues. Application instances are started as real processes from the current sources. Nothing is mocked: PostgreSQL and SQS are always real.
 
 ```sh
 bun test ./test/unit/config.test.ts                                   # one file
@@ -95,17 +95,36 @@ bun test ./test/unit -t "rejects an unknown role"                     # one test
 bun test --preload ./test/support/preload.ts ./test/integration/health.test.ts
 ```
 
-On Windows a process cannot catch SIGTERM, so graceful shutdown is checked against a container (`docker stop`), where it runs on Linux.
+On Windows a process cannot catch SIGTERM, so graceful shutdown is tested in a Linux container: `test/integration/graceful-shutdown.test.ts` builds the image from the current sources (`wagering-app:test`), runs a consumer on the compose network (`wagering_default`) and stops it with `docker stop`.
 
 ## Endpoints
 
 | Endpoint | Purpose |
 |---|---|
+| `POST /wallets` | Open a wallet: `{ "playerId", "initialBalance": { "amount", "currency" } }` |
+| `GET /wallets/:walletId` | A wallet and its balance |
+| `GET /wallets/:walletId/ledger?cursor=&limit=` | Ledger entries, newest first, 50 per page by default and 100 at most |
+| `POST /wallets/:walletId/reconciliation` | Stored balance against the balance rebuilt from the ledger |
+| `POST /wagering/transactions` | Submit a `BET`, `WIN`, `LOSS`, `REFUND` or `ROLLBACK`; the `Idempotency-Key` header is required |
+| `GET /wagering/transactions/:transactionId` | A transaction by its id |
+| `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | A transaction by the provider's id |
 | `GET /health/live` | The process is up. Checks no dependency. |
 | `GET /health/ready` | PostgreSQL answers and SQS resolves the inbound queue; 503 otherwise. |
 | `GET /metrics` | Prometheus metrics of the instance that answers. Through the proxy, each request may reach a different replica. |
 
-Requests may carry an `x-correlation-id` header; it is echoed back and attached to every log line, and one is generated when absent.
+A submission answers 200 when processed (also on a replay, with `idempotentReplay: true`), 202 when it waits for its reference, and 422 when it is rejected or failed, with its `failureCode`. Every other error is an RFC 9457 `application/problem+json` body with a stable `code`; a 503 means "resend later with the same key" and carries `Retry-After`. [ARCHITECTURE.md](ARCHITECTURE.md#11-http-api-9) has the full contract.
+
+```sh
+curl -s -X POST http://localhost:3000/wallets -H "content-type: application/json" \
+  -d '{"playerId":"player-1","initialBalance":{"amount":"1000.00","currency":"BRL"}}'
+curl -s -X POST http://localhost:3000/wagering/transactions -H "content-type: application/json" \
+  -H "Idempotency-Key: provider-a:transaction-123" \
+  -d '{"providerId":"provider-a","externalTransactionId":"transaction-123","playerId":"player-1","walletId":"<id from the first answer>","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}'
+```
+
+The same transaction can be sent to `wager-transactions.fifo` as a `WagerTransactionRequested` message (§10 of the statement), with its idempotency key in `data.idempotencyKey`; the events produced come out on `wager-events.fifo`.
+
+Requests may carry an `x-correlation-id` header; it is echoed back and attached to every log line, and one is generated when absent. A queue message may carry a `correlationId` message attribute for the same purpose.
 
 ## Configuration
 
@@ -133,6 +152,19 @@ Environment variables, validated at boot. An invalid or missing value stops the 
 | `SQS_WAGER_TRANSACTIONS_DLQ` | `wager-transactions-dlq.fifo` | Dead-letter queue of the inbound queue |
 | `SQS_WAGER_EVENTS_QUEUE` | `wager-events.fifo` | Queue that receives the integration events |
 | `SQS_MAX_RECEIVE_COUNT` | `5` | Receives before a message moves to the dead-letter queue |
+| `HTTP_BODY_LIMIT_BYTES` | `16384` | Larger request bodies are refused with 413 |
+| `SQS_RECEIVE_WAIT_SECONDS` | `20` | Long poll of each receive; shutdown aborts it |
+| `SQS_VISIBILITY_TIMEOUT_SECONDS` | `30` | Visibility timeout set on each receive; it must outlast the long poll plus the processing of a message (being above `SQS_RECEIVE_WAIT_SECONDS` is checked at boot) |
+| `SQS_RECEIVE_BATCH_SIZE` | `10` | Messages per receive |
+| `SQS_RETRY_BASE_MS` / `SQS_RETRY_CAP_MS` | `5000` / `60000` | Full-jitter backoff, on the visibility timeout, of a message that failed transiently |
+| `OUTBOX_BATCH_SIZE` | `10` | Events claimed per publishing round, at most one per wallet; with `OUTBOX_PUBLISH_TIMEOUT_MS`, a round must fit within `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS` (checked at boot) |
+| `OUTBOX_POLL_INTERVAL_MS` | `500` | Wait after a publishing round that found less than a full batch |
+| `OUTBOX_PUBLISH_TIMEOUT_MS` | `5000` | Request timeout of the publisher's own SQS client |
+| `OUTBOX_ALERT_ATTEMPTS` | `10` | Failed attempts from which a pending event counts in the alert gauge |
+| `REFERENCE_RETRY_BATCH_SIZE` | `50` | Parked transactions taken per retry round |
+| `REFERENCE_RETRY_POLL_INTERVAL_MS` | `1000` | Wait after a retry round with nothing due |
+| `OUTAGE_BACKOFF_BASE_MS` / `OUTAGE_BACKOFF_CAP_MS` | `1000` / `30000` | Full-jitter pacing of the consumer and the workers while PostgreSQL or SQS is unavailable |
+| `TEST_CONSUMER_ACK_DELAY_MS` | `0` | Test seam, accepted only with `NODE_ENV=test`: a pause between a message's commit and its acknowledgement |
 
 Bun loads `.env` automatically for processes started on the host. Containers get their values from `compose.yaml`.
 

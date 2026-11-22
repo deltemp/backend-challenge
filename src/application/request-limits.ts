@@ -23,10 +23,13 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 // No identifier needs a control character, and PostgreSQL text cannot hold NUL. MikroORM writes
 // values into the SQL text, where a NUL would even end the protocol message early (08P01). An
 // unpaired surrogate is not text at all: encoded as UTF-8 it becomes U+FFFD, so two different
-// ids would be stored as the same one. The schema checks neither; only the use cases write ids.
-const UNSUPPORTED_CHARACTER = /[\p{Cc}\p{Cs}]/u;
+// ids would be stored as the same one. U+FFFE and U+FFFF are the characters left that SQS refuses
+// in a message: events carry identifiers, and one SQS can never accept would be retried forever,
+// holding back every later event of its wallet. The schema checks none of these; only the use
+// cases write identifiers.
+const UNSUPPORTED_CHARACTER = /[\p{Cc}\p{Cs}\uFFFE\uFFFF]/u;
 
-type IdentifierPath = keyof typeof IDENTIFIER_LIMITS;
+export type IdentifierPath = keyof typeof IDENTIFIER_LIMITS;
 
 /** Ids the application generates are lowercase UUIDs; anything else can match no row. */
 export function isUuid(value: string): boolean {
@@ -41,13 +44,14 @@ export function isIdentifier(path: IdentifierPath, value: string): boolean {
   return identifierIssue(path, value) === undefined;
 }
 
-function identifierIssue(path: IdentifierPath, value: string): string | undefined {
+/** What is wrong with the value as this identifier, or undefined when the use cases accept it. */
+export function identifierIssue(path: IdentifierPath, value: string): string | undefined {
   const max = IDENTIFIER_LIMITS[path];
   if (value.length === 0 || value.length > max) {
     return `must have 1 to ${max} characters`;
   }
   return UNSUPPORTED_CHARACTER.test(value)
-    ? "must not contain control characters or unpaired surrogates"
+    ? "must not contain control characters, unpaired surrogates, U+FFFE or U+FFFF"
     : undefined;
 }
 

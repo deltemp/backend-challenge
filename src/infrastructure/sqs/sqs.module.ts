@@ -2,6 +2,7 @@ import type { SQSClient } from "@aws-sdk/client-sqs";
 import { Global, Inject, Injectable, Module, type OnApplicationShutdown } from "@nestjs/common";
 import type { AppConfig } from "../config/config";
 import { APP_CONFIG } from "../config/config.module";
+import { QueueUrls } from "./queue-urls";
 import { createSqsClient, SQS_CLIENT } from "./sqs-client";
 
 @Injectable()
@@ -21,8 +22,13 @@ class SqsClientLifecycle implements OnApplicationShutdown {
       inject: [APP_CONFIG],
       useFactory: (config: AppConfig) => createSqsClient(config.aws),
     },
+    {
+      provide: QueueUrls,
+      inject: [SQS_CLIENT],
+      useFactory: (client: SQSClient) => new QueueUrls(client),
+    },
     SqsClientLifecycle,
   ],
-  exports: [SQS_CLIENT],
+  exports: [SQS_CLIENT, QueueUrls],
 })
 export class SqsModule {}

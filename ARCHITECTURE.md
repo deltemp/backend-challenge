@@ -4,11 +4,11 @@ This document records the architectural decisions of the Distributed Wagering Pr
 
 ## Implementation status
 
-The decisions below describe the target design. Only part of it exists today:
+Every mandatory requirement is implemented; tracing and the full load test come next:
 
 | Area | Status |
 |---|---|
-| Configuration, structured logs, metrics, health checks, graceful shutdown | Implemented |
+| Configuration, structured logs, metrics, health checks, graceful shutdown | Implemented; shutdown tested in a container |
 | MikroORM setup, migration tooling, SQS queue provisioning | Implemented |
 | Docker Compose stack (provision job, 3 replicas, nginx, k6 profile) | Implemented |
 | Test harness (per-file databases and queues, real processes) | Implemented |
@@ -16,9 +16,8 @@ The decisions below describe the target design. Only part of it exists today:
 | Domain model: `Money`, `Wallet`, ledger, `WagerTransaction` and its rules, events, inbox and outbox | Implemented, unit-tested |
 | Persistence records and the first migration, with every schema guarantee of [section 8](#8-persistence-and-transactional-strategy) | Implemented, tested on PostgreSQL |
 | Use cases (wallets, transactions, queries, reconciliation, reference retries, outbox publishing), repositories, unit of work, SQS event publisher | Implemented, tested on PostgreSQL and LocalStack |
-| Wagering HTTP API | Designed, not implemented |
-| SQS consumer loop, outbox and retry worker loops, business metrics | Designed, not implemented (the use cases they run exist) |
-| RFC 9457 error responses | Designed, not implemented |
+| Wagering HTTP API, with RFC 9457 error responses | Implemented, tested over HTTP on a real process |
+| SQS consumer, outbox publisher, reference retry worker, business metrics | Implemented, tested with real processes, including the multi-process scenarios of §13 |
 | OpenTelemetry tracing, load test | Deferred until the mandatory scope is green (k6 wiring exists) |
 
 ## 1. Overview
@@ -91,6 +90,8 @@ src/interfaces       HTTP controllers, SQS consumer, background workers
 Dependencies point inward: `interfaces → application → domain`, and `infrastructure` implements the ports that `application` declares. `src/domain` depends on no package but decimal.js; it also uses Node's built-in `node:crypto` for the payload hash. A unit test scans its imports and fails on anything else.
 
 The application layer holds the use cases, one class each, and the ports they need: repositories bound to a unit of work, a clock, an id generator and an event publisher. Use cases take plain commands and return plain views (decimal strings, ISO dates); they do no logging and record no metrics, because their results say what happened, and the interfaces that call them log and measure from those results. `createUseCases` in `src/infrastructure/use-cases.ts` is the composition root: it wires the MikroORM unit of work, the system clock, UUIDv7 ids and the SQS publisher, and tests replace any of them.
+
+The interfaces are thin. Each role (`api`, `consumer`, `outbox`, `retry`) is a NestJS module that `AppModule` imports only when `APP_ROLES` lists it. The HTTP controllers and the SQS consumer validate their input with the same Zod contracts (`src/interfaces/contracts.ts`), whose rules come from the layer that owns them (identifier limits from the use cases, amounts and currencies from `Money`), call the same use case, and record metrics from its result through `WageringTelemetry`. The background loops share their pacing helpers. They are all aborted in `onModuleDestroy`, which NestJS runs for every module before any `beforeApplicationShutdown` (that hook runs one module after another), and awaited in `beforeApplicationShutdown`, before the ORM and the SQS client close.
 
 The code is one bounded context organized in layers, not a set of feature modules. The central use case writes the inbox row, the wager transaction, the wallet balance, the ledger entry and the outbox rows in a single SQL transaction. Splitting wallets, wagering and outbox into separate modules would draw boundaries straight through that transaction and force coordination between them, for no gain at this size.
 
@@ -260,7 +261,7 @@ MikroORM is the option §4 prefers, and it fits this design: an explicit Unit of
 
 The inbox row (SQS entry only), the wager transaction, the wallet balance and version, the ledger entry and the outbox rows commit together or not at all. Every unit of work forks its own EntityManager explicitly: there is no implicit per-request context (`registerRequestContext: false`), and the global EntityManager refuses use (`allowGlobalContext: false`).
 
-`SubmitWagerTransaction` runs in this order. First, before any SQL: validate the request (identifier limits, no control characters or unpaired surrogates, a lowercase UUID wallet id, the kind, the money) and build the transaction, so an invalid request never takes a lock. Then, in the SQL transaction: lock the wallet; look the idempotency key up; if the request came from the queue and its message is already in the inbox, answer from the transaction it produced (the same message id with another payload is refused as an inbox conflict); otherwise the key answers a replay or a conflict; look the provider's id up, which answers a conflict; resolve the reference and whether it was reversed; get or create the provider's settlement account; apply the rules; write the balance and its entry when the transaction moves money, then the transaction, its events and the inbox row. A unique violation on the idempotency key, the provider's id or the inbox means that a copy of the request on another wallet committed first (copies on the same wallet wait for its lock and become replays): the use case runs once more, finds that row and answers from it. The reversal index is retried the same way, only as a backstop: every reversal runs under its reference's wallet lock, which rules out a genuine race there. The second run looks the winner's row up before inserting (a committed reversal makes it reject), so a violation on it is no contention but a bug, such as a unique index out of step with the lookups: it propagates as a 500 (`UNEXPECTED_ERROR`), with nothing committed, instead of a `WALLET_BUSY` that every resend would meet again.
+`SubmitWagerTransaction` runs in this order. First, before any SQL: validate the request (identifier limits; no control characters, unpaired surrogates, U+FFFE or U+FFFF; a lowercase UUID wallet id; the kind; the money) and build the transaction, so an invalid request never takes a lock. Then, in the SQL transaction: lock the wallet; look the idempotency key up; if the request came from the queue and its message is already in the inbox, answer from the transaction it produced (the same message id with another payload is refused as an inbox conflict); otherwise the key answers a replay or a conflict; look the provider's id up, which answers a conflict; resolve the reference and whether it was reversed; get or create the provider's settlement account; apply the rules; write the balance and its entry when the transaction moves money, then the transaction, its events and the inbox row. A unique violation on the idempotency key, the provider's id or the inbox means that a copy of the request on another wallet committed first (copies on the same wallet wait for its lock and become replays): the use case runs once more, finds that row and answers from it. The reversal index is retried the same way, only as a backstop: every reversal runs under its reference's wallet lock, which rules out a genuine race there. The second run looks the winner's row up before inserting (a committed reversal makes it reject), so a violation on it is no contention but a bug, such as a unique index out of step with the lookups: it propagates as a 500 (`UNEXPECTED_ERROR`), with nothing committed, instead of a `WALLET_BUSY` that every resend would meet again.
 
 ### Repositories and the unit of work
 
@@ -332,17 +333,20 @@ All three are FIFO queues with content-based deduplication off, so senders must 
 
 ### Consumer
 
-- It calls the same use case as the HTTP entry point and deduplicates through the persistent inbox, keyed on `(consumerName, messageId)`.
+- It reads §10's message (`messageId`, `type: WagerTransactionRequested`, `occurredAt`, `data` with the idempotency key in `data.idempotencyKey`), validates `data` with the same contract as the HTTP body, calls the same use case as the HTTP entry point, and deduplicates through the persistent inbox, keyed on `(wager-transactions, messageId)`. Unknown envelope fields are ignored, so producers can add transport metadata; unknown transaction fields are refused, as over HTTP.
 - It acknowledges (deletes) a message only after the SQL transaction commits. A crash between commit and acknowledgement means a redelivery, which the inbox and the idempotency key turn into a no-op.
-- Errors fall into three classes:
-  - A business rejection is a final result, so the message is acknowledged.
-  - A transient error extends the visibility timeout with full-jitter exponential backoff: base 5 s, cap 60 s.
-  - A permanent error (malformed message, unknown type, unknown wallet) goes straight to the DLQ.
+- Errors fall into four classes:
+  - A business rejection is a final result, so the message is acknowledged; so is any stored outcome a replay returns.
+  - A transient error is retried. A busy wallet extends the visibility timeout with full-jitter exponential backoff: base 5 s, cap 60 s. An unavailable dependency pauses the consumer instead (below).
+  - A permanent error goes straight to the DLQ: a malformed message, an unknown type, a validation failure, an unknown wallet, and any conflict (the same message id with another payload, the same idempotency key with another payload, the provider's id under another key). Over HTTP a conflict is a 409 to the caller; from the queue nobody would ever see it if the message were acknowledged.
+  - An unexpected error, a bug, is retried like a transient one, logged and counted. A sporadic bug resolves itself; a persistent one reaches the DLQ through the redrive policy instead of being dropped on its first occurrence. Nothing is committed either way.
 
-  The redrive policy caps all of it at 5 receives, at most about 2 min 15 s of retries.
-- **It pauses during outages.** While PostgreSQL or SQS is unreachable, the consumer stops receiving and probes the dependency with backoff before resuming. Without this, an outage of a few minutes would use up the 5 receives of every message in flight and push healthy messages to the DLQ, where they would need a manual redrive. Per-message backoff is left for isolated failures, such as a lock timeout.
+  The redrive policy caps the retries at 5 receives, at most about 2 min 15 s.
+- **Dead-lettering is a copy and a delete.** SQS has no call that moves a message to the DLQ, so the consumer sends a copy (same body, group and attributes, the original SQS message id as `MessageDeduplicationId`, and a `deadLetterReason` attribute) and then deletes the original. A crash in between leaves a duplicate in the DLQ, never a lost message, and the deduplication id absorbs it within five minutes. Messages moved by the redrive policy carry no reason: they ran out of receives.
+- Messages of one group, a wallet, are processed in order; the groups of a batch in parallel. When one meets a busy wallet, the rest of its group in the batch is handed back at once: FIFO delivers none of a group while its head is invisible, so a later bet cannot overtake an earlier one that met a lock timeout, and the neighbours would have met the same lock anyway. After a bug the group goes on: held back, the neighbours of a message bound for the DLQ would spend their receives along with it and follow it there. A sporadic bug can then let a later message overtake it, which the rules tolerate (an out-of-order reversal waits in `PENDING_REFERENCE`). A `correlationId` message attribute is kept when it is safe to log, like the HTTP header.
+- **It pauses during outages.** While PostgreSQL or SQS is unreachable, the consumer stops receiving and probes the dependency with backoff before resuming. Every receive counts against the redrive limit, so the consumer checks PostgreSQL before each one; a failed check, a failed receive or a message that fails with `DEPENDENCY_UNAVAILABLE` starts the pause. That message keeps the visibility timeout of its receive rather than the short per-message backoff, so the instances that have not noticed the outage yet do not receive it meanwhile (no long poll opened before the outage can return it, as long as the visibility timeout outlasts the long poll plus the processing of a message: the configuration refuses a timeout that does not outlast the long poll, and the defaults of 30 and 20 seconds leave 10 for the processing), and the rest of the batch comes back after its visibility timeout. Without this, an outage of a few minutes would use up the 5 receives of every message in flight, one per instance, and push healthy messages to the DLQ, where they would need a manual redrive. At worst, an instance that received just as the outage began spends one receive of each message of that batch. Per-message backoff is left for isolated failures, such as a lock timeout.
 - Producers are expected to use `walletId` as `MessageGroupId`, which preserves per-wallet order and parallelizes across wallets. Correctness does not depend on it.
-- On `SIGTERM` it stops polling, then finishes the messages in flight or returns their visibility. The queue's 20-second long poll is longer than the 10-second shutdown budget, so every receive gets an `AbortSignal` that shutdown aborts first.
+- On `SIGTERM` it stops polling, finishes the messages in flight, and hands the received ones it has not started back at once (visibility 0), so another instance takes them without waiting. The queue's 20-second long poll is longer than the 10-second shutdown budget, so every receive gets an `AbortSignal` that shutdown aborts first.
 
 ### Transactional outbox (§11)
 
@@ -352,6 +356,7 @@ All three are FIFO queues with content-based deduplication off, so senders must 
 - If a process dies after the commit but before publishing, the rows stay pending and another instance publishes them.
 - Delivery is at-least-once. A publication repeated after a crash carries the same `eventId`, so SQS deduplicates it within its 5-minute window, and consumers deduplicate on `eventId` beyond it.
 - A failed publication reschedules the row; it is never dropped ([section 10](#10-retry-policies)).
+- **The publisher loop.** Each instance with the `outbox` role runs rounds of `PublishOutbox` (10 events, one per wallet), going on at once after a full round and waiting `OUTBOX_POLL_INTERVAL_MS` after a partial one. It has an SQS client of its own, with a 5-second request timeout and a single attempt: the outbox has its own backoff, and the round's SQL transaction stays open while it publishes, so an SDK retry loop would only hold the row locks longer. Shutdown aborts the call in flight; its events are rescheduled. A round that publishes nothing (SQS is likely down) makes the loop back off as a whole, on top of each event's own backoff, and `loadConfig` refuses a batch size and publish timeout under which a round's calls could outlast the idle-in-transaction limit.
 
 ## 10. Retry policies
 
@@ -373,7 +378,7 @@ Pacing and termination are separate concerns, and each retry needs both.
 
 The TTL errs long on purpose. A reversal rejected before its `BET` arrives leaves the player debited for a bet the provider cancelled, while waiting longer only costs a few cheap lookups. Out-of-order operations normally arrive within seconds or a few minutes.
 
-**Reprocessing locks the wallet first.** The retry worker lists due transactions without locking them, oldest first. For each, it locks the wallet with `SKIP LOCKED` (a busy wallet is simply visited later), reads the transaction again under that lock and goes on only if it is still parked and due, so concurrent workers never apply it twice. An unexpected, non-transient error marks it `FAILED` with `INTERNAL_ERROR` in a fresh unit of work and raises `WagerTransactionFailed`; a transient error (a busy wallet, an unavailable dependency) leaves it parked for a later attempt. A violation of the reversal index runs it once more in the same call. Since every reversal runs under its reference's wallet lock, the violation cannot be a genuine race: the second run either sees a reversal committed meanwhile, which rejects this one, or violates the index again. That is a bug, and it ends `FAILED` like any other duplicate key, instead of failing the same way at every attempt with the transaction parked forever.
+**Reprocessing locks the wallet first.** The retry worker lists due transactions without locking them, oldest first, and reprocesses them one at a time, so a chain resolves in order within a process. A round that only skipped busy wallets, or failed transiently, changes no `next_attempt_at`, so the loop waits before the next one instead of spinning on the same rows. A busy wallet is skipped, never waited for, so one hot wallet cannot hold back the transactions behind it; only an unavailable dependency ends a round. For each transaction, it locks the wallet with `SKIP LOCKED` (a busy wallet is simply visited later), reads the transaction again under that lock and goes on only if it is still parked and due, so concurrent workers never apply it twice. An unexpected, non-transient error marks it `FAILED` with `INTERNAL_ERROR` in a fresh unit of work and raises `WagerTransactionFailed`; a transient error (a busy wallet, an unavailable dependency) leaves it parked for a later attempt. A violation of the reversal index runs it once more in the same call. Since every reversal runs under its reference's wallet lock, the violation cannot be a genuine race: the second run either sees a reversal committed meanwhile, which rejects this one, or violates the index again. That is a bug, and it ends `FAILED` like any other duplicate key, instead of failing the same way at every attempt with the transaction parked forever.
 
 **The outbox never gives up.** A confirmed event must never be lost (§3), so it has no TTL and no attempt limit. A gauge counts pending rows with 10 or more attempts; together with outbox lag, that is the alert signal, and the outbox table itself is the list of rows needing intervention.
 
@@ -403,7 +408,7 @@ The TTL errs long on purpose. A reversal rejected before its `BET` arrives leave
 | Invalid payload, missing `Idempotency-Key`, `kind: OPENING` | 400 |
 | Unknown wallet or transaction | 404 |
 | Idempotency conflict; duplicate wallet for the same player and currency | 409 |
-| Transaction `REJECTED` by a business rule (the body is the transaction, with `failureCode`) | 422 |
+| Transaction `REJECTED` by a business rule, or `FAILED` (the body is the submission, with `failureCode`) | 422 |
 | Body larger than the accepted limit | 413 |
 | Unexpected failure (a bug) | 500 |
 | Transient infrastructure failure, with `Retry-After` | 503 |
@@ -413,6 +418,12 @@ The TTL errs long on purpose. A reversal rejected before its `BET` arrives leave
 - **A processed transaction answers 200 on the first call and on every replay.** §9 requires an identical request to get the same response. Answering 201 the first time and 200 afterwards would break that; the `idempotentReplay` field tells the two apart.
 - **Business rejections get their own status (422)**, with the stored transaction as the body. Answering 200 with a `REJECTED` status in the body, as many iGaming wallet APIs do, would force providers to parse the body to learn the outcome.
 - **503 means "resend with the same key".** Nothing was committed, so retrying is safe.
+- **A `FAILED` transaction answers 422 on every replay of its key.** It is a final outcome that is no success, like a rejection, and the body tells them apart (`status: FAILED`, `failureCode: INTERNAL_ERROR`). A 5xx would tell the provider to resend, and every resend would meet the same stored outcome.
+- **Lookups answer 200 whatever the transaction's status.** `GET /wagering/transactions/:id` and the lookup by provider id succeeded, so they say so; the outcome is in the body.
+
+A submission answers the statement's shape plus the failure code: `{ transactionId, status, failureCode, balance, idempotentReplay }`, where `balance` is the balance observed when the outcome was decided, which every replay returns. Wallet creation answers the wallet (`id`, `playerId`, `balance`, `version`, timestamps), and lookups the full transaction.
+
+Request bodies are strict: an unknown field is a validation error, so a misspelled `referenceExternalTransactionId` cannot pass silently as "no reference"; a null reference counts as none. Bodies above 16 KiB (`HTTP_BODY_LIMIT_BYTES`) are refused before parsing. A missing or blank `Idempotency-Key` is reported before anything else a readable request breaks: a guard checks it, and guards run before the validation pipes. Only a body that is not JSON, or too large, is answered first, by the parser that runs before any route.
 
 ### Protocol errors
 
@@ -420,7 +431,9 @@ Every error that is not a business rejection is an RFC 9457 `application/problem
 
 - `type` is `about:blank`, with `title`, `status`, `detail` and `instance` (the request path);
 - the extension member `code` carries a stable, machine-readable code, and `correlationId` ties the response to the logs;
-- `VALIDATION_FAILED` adds `errors: [{ path, message }]`, one entry per broken rule.
+- `VALIDATION_FAILED` adds `errors: [{ path, message }]`, one entry per broken rule. A path is dotted (`money.amount`); an empty path is the request as a whole (an unknown field, or a domain rule such as a `REFUND` without reference), and the idempotency key is reported under its header's name.
+- `WALLET_ALREADY_EXISTS` adds the `walletId` that exists. `Retry-After` is 1 second for `WALLET_BUSY`, which clears within a lock timeout, and 5 for `DEPENDENCY_UNAVAILABLE`.
+- `detail` comes from a fixed table per code, never from an error message, which may name another provider's transaction.
 
 Every 503 carries `Retry-After`. Resending any 5xx with the same idempotency key is safe: either nothing was committed, or the retry is answered as a replay. Like failure codes, these codes are a public contract.
 
@@ -475,7 +488,8 @@ No user table or password hashing is ever built. Messages from the queue are a t
 - **One image and one entry point.** `APP_ROLES` (`api`, `consumer`, `outbox`, `retry`) selects what each process runs, and Compose runs three replicas with every role. That proves every component is safe with several instances, while tests can still start a single role on its own.
 - **Every process serves health and metrics** over HTTP, whatever its roles. Orchestrators and tests can therefore probe worker-only processes too. The `api` role adds the wagering API.
 - **Readiness checks the dependencies.** `/health/live` checks only the process. `/health/ready` runs a real `select 1` on PostgreSQL (MikroORM connects lazily, so its connection flags prove nothing) and resolves the inbound queue on SQS. Error details go to the logs, never to the public response.
-- **Shutdown is graceful and bounded.** On `SIGTERM`, NestJS closes the HTTP server, then the database and SQS clients. A watchdog forces an exit after `SHUTDOWN_TIMEOUT_MS` (10 s), which is shorter than Compose's 15-second grace period. Exit code 143 is the expected result: NestJS re-raises the signal once its cleanup is done.
+- **Shutdown is graceful and bounded.** On `SIGTERM`, the consumer and the workers are all aborted at once (`onModuleDestroy`), then awaited: the consumer's long poll ends at once, it finishes the messages in flight and hands the others back, the outbox publisher aborts its SQS call, and the retry worker finishes the transaction in hand. NestJS then closes the HTTP server, the database and the SQS clients. A watchdog forces an exit after `SHUTDOWN_TIMEOUT_MS` (10 s), which is shorter than Compose's 15-second grace period. Exit code 143 is the expected result: NestJS re-raises the signal once its cleanup is done, which is why the container runs with an init process (`init: true`): as PID 1, `bun` would ignore the re-raised signal.
+- **Outages are paced, not fatal.** A process starts while PostgreSQL or SQS is down (readiness stays false until they answer), and every loop backs off with full jitter (`OUTAGE_BACKOFF_*`) while a dependency is unavailable instead of exiting or spinning.
 
 ### Docker Compose
 
@@ -506,10 +520,23 @@ No user table or password hashing is ever built. Messages from the queue are a t
   - Financial keys and secrets are redacted.
   - Errors are serialized through an allowlist (type, message, stack, code, constraint, table, column, cause). PostgreSQL errors carry row values in `detail`, and the failed query in other fields, so those are never logged.
 - **Metrics** come from prom-client, per process.
-  - HTTP durations are labelled by matched route, never by raw path. The business metrics required by §12 (transactions by status, duplicates, retries, DLQ messages, lock conflicts, outbox lag, processing latency) arrive with the interfaces that run the use cases, which record them from the use cases' results.
+  - HTTP durations are labelled by matched route, never by raw path.
+  - The business metrics of §12 are recorded by the interfaces from the use cases' results:
+
+    | §12 asks for | Metric |
+    |---|---|
+    | Transactions by status | `wager_transactions_total{source,kind,status}`, source being `http`, `sqs` or `retry` |
+    | Duplicates detected | `wager_duplicates_total{source,type}`: idempotent replays, redelivered messages, conflicts |
+    | Retries | `wager_retries_total{operation,reason}`: messages, parked transactions, publications |
+    | Messages in the DLQ | `sqs_dlq_messages` (queue depth), `sqs_dead_lettered_messages_total{reason}` |
+    | Lock conflicts | `wallet_lock_conflicts_total{source}`: lock timeouts, and busy wallets the retry worker skipped |
+    | Outbox lag | `outbox_lag_seconds` (age of the oldest unpublished event), `outbox_pending_events`, `outbox_events_over_attempt_threshold` |
+    | Processing latency | `wager_processing_duration_seconds{source,outcome}` |
+
+    They come with `wager_pending_references`, `reconciliation_divergences_total`, `outbox_events_published_total`, `unexpected_errors_total{component}` and `sqs_consumer_paused`.
   - Labels never carry amounts or unbounded identifiers.
   - Metrics must be read from each replica, never through the proxy, which hands each scrape to a different replica.
-  - Gauges of shared state (outbox lag, DLQ depth, pending references) are computed from PostgreSQL or SQS, so every replica reports the same value.
+  - Gauges of shared state (outbox backlog and lag, events over the attempt threshold, DLQ depth, pending references) are read from PostgreSQL or SQS at scrape time, so every replica reports the same value. A failed read is logged and leaves the gauge as it was; it never fails the scrape. The lag compares the database's clock with the `occurred_at` each instance wrote from its own, so clock skew shifts it; it is floored at zero.
 - **Tracing** with OpenTelemetry is deferred until the mandatory scope is green. It will use manual spans from HTTP through the use case, the SQL transaction, the outbox and SQS, with trace context propagated in messages, plus a Grafana dashboard in an optional Compose profile. Spans have to be manual: the official NestJS instrumentation does not support NestJS 12 yet, and automatic instrumentation is fragile on the Bun runtime.
 
 ## 15. Testing strategy (§13)
@@ -517,12 +544,15 @@ No user table or password hashing is ever built. Messages from the queue are a t
 - **PostgreSQL and SQS are always real.** Integration and concurrency tests run against PostgreSQL and LocalStack in containers; nothing is mocked (§14).
 - **Isolation per file.** Each test file gets its own database, cloned in a fraction of a second from a template migrated once per run, and its own queues. Workers that scan whole tables, such as the outbox publisher, therefore never see another file's rows.
 - **Real processes.** Application instances run as real OS processes built from the current sources, so multi-instance scenarios use real parallelism and crash scenarios use `SIGKILL`.
-  - Windows cannot deliver a catchable `SIGTERM`, so graceful shutdown is tested against a container.
+  - Windows cannot deliver a catchable `SIGTERM`, so graceful shutdown is tested in a container: the test builds the image from the current sources, runs a consumer on the compose network against its own database and queues, and stops it with `docker stop` while a message waits for its acknowledgement.
+- **The interfaces are tested over their real transports.** `http-api.test.ts` drives every status code and problem code through HTTP; `sqs-consumer.test.ts` covers the inbox and redelivery, rejections, each permanent error and its dead-letter reason, transient retries, the redrive policy, and a consumer that pauses before receiving while PostgreSQL is unreachable, so the outage spends no receive; `workers.test.ts` covers publication in commit order, a reversal applied once its reference arrives, and the deadline.
+- **The multi-process scenarios of §13** (`test/concurrency/instances.test.ts`): §8 across instances, the same bet 50 times over HTTP and the queue on three instances, distinct wallets in parallel, a reversal before its reference across processes, a consumer killed between commit and acknowledgement, two publishers in two processes, and a restart of every instance mid-traffic.
+- **One test seam.** To kill a consumer exactly between commit and acknowledgement, `TEST_CONSUMER_ACK_DELAY_MS` holds each message after its commit; the test waits for the commit to appear, kills the process with `SIGKILL`, and checks that the redelivery is answered from the inbox. The configuration refuses it unless `NODE_ENV=test`, and it is the only test-only path in the application.
 - **Determinism.** Tests wait on observable conditions, never on `sleep`.
 - **Final invariant.** Every integration and concurrency test ends by asserting that the wallet balance equals the balance rebuilt from the ledger (`ledgerDiscrepancies` in `test/support/ledger.ts`).
 - **The schema is tested on its own.** `test/integration/schema.test.ts` writes raw SQL that bypasses the application and proves each guarantee of [section 8](#8-persistence-and-transactional-strategy) by the SQLSTATE and the constraint name of the refusal, next to the valid case that commits. `test/integration/records.test.ts` round-trips the persistence records through MikroORM.
 - **Use cases are tested against the real infrastructure.** Each integration file opens the use cases on a database of its own, with the application's session timeouts, and publishes to LocalStack. A controllable clock and a fixed random value make deadlines and backoff exact, and a wrapped unit of work injects the faults that drive a transaction to `FAILED`.
-- **Concurrency at the use-case level.** `test/concurrency/use-cases.test.ts` runs the §8 scenario, the same bet 50 times in parallel, distinct wallets in parallel, a reversal racing its reference and the retry worker, and two publishers over one outbox. Each call is its own SQL transaction on its own connection, so PostgreSQL sees real concurrency. This exercises the database-level locking for real, but does not replace the multi-process versions of the scenarios (three instances, two publishers in two processes, a worker killed between commit and acknowledgement, a restart), which come with the HTTP API, the consumer and the worker loops.
+- **Concurrency at the use-case level.** `test/concurrency/use-cases.test.ts` runs the §8 scenario, the same bet 50 times in parallel, distinct wallets in parallel, a reversal racing its reference and the retry worker, and two publishers over one outbox. Each call is its own SQL transaction on its own connection, so PostgreSQL sees real concurrency; the multi-process versions above complete it.
 - **Unit tests follow §13.** `test/unit/domain` covers `Money`, the `Wallet` invariants, the rules of each kind (including precedence, pending references and chains), currency conflicts and the payload hash with independently computed SHA-256 vectors. Time and randomness are fixed values, so backoff and deadlines are exact.
 - **Load test.** `bun run test:load` runs k6 through the proxy; today it is a smoke run. The real load test, reporting environment, methodology, throughput, p50/p95/p99, error rate, concurrency conflicts and outbox lag, comes after the mandatory scope.
 
@@ -535,7 +565,12 @@ No user table or password hashing is ever built. Messages from the queue are a t
 - **At-least-once events.** Consumers of `wager-events.fifo` must deduplicate on `eventId`.
 - **Outbox head-of-line blocking.** An event that keeps failing holds back the later events of its wallet until it is published.
 - **Outbox throughput per wallet.** A publication round takes one event per wallet, so a wallet's backlog drains at one event per round; the publisher loop runs rounds back to back while there is work.
-- **Publishing inside a transaction.** The publisher holds its row locks during the SQS call. A call that outlasts the 30-second idle-in-transaction limit makes PostgreSQL end the session: the round rolls back and its events stay pending for another round, which is safe, only slower. The worker loop will use an SQS client of its own with a short timeout and a single attempt, since the outbox already retries with backoff.
+- **Publishing inside a transaction.** The publisher holds its row locks during the SQS call. A call that outlasts the 30-second idle-in-transaction limit makes PostgreSQL end the session: the round rolls back and its events stay pending for another round, which is safe, only slower. The publisher's own SQS client, with a 5-second timeout and a single attempt, keeps that from happening, and `loadConfig` refuses settings under which a round's calls could add up past the limit.
+- **Dead-letter copies.** A crash between the copy to the DLQ and the delete of the original leaves a duplicate in the DLQ after the five-minute deduplication window. A dead letter keeps at most nine of the original message attributes, next to its reason (SQS allows ten).
+- **A crash after the commit.** A consumer killed between commit and acknowledgement holds its messages until their visibility timeout (30 s) ends; only then are they redelivered and answered from the inbox.
+- **An aborted long poll.** Aborting a receive at shutdown closes the request, not the receive on the SQS side: messages SQS was returning at that instant stay invisible until their visibility timeout ends, then come back. They are delayed, never lost.
+- **The test seam.** `TEST_CONSUMER_ACK_DELAY_MS` is application code that exists only for a test, refused outside `NODE_ENV=test`. It was preferred to simulating the crash, because it kills a real consumer at the exact point §13 names.
+- **The shutdown test needs the compose network.** It runs its container on `wagering_default`, the network compose creates for the project name in `compose.yaml`.
 - **A provider's first settlement account.** The very first transaction of a provider in a currency creates its settlement account. Until that transaction commits, a concurrent transaction of another wallet of the same provider waits for it, briefly and bounded by `lock_timeout`; once the account exists, it is only ever read.
 - **Long outages.** An outage longer than a reversal's TTL can expire it while its `BET` is still waiting in the inbound queue.
 - **LocalStack** requires an auth token to run the project, and keeps no state: if it restarts on its own, the queues are gone until `docker compose up` runs `provision` again.
@@ -545,12 +580,11 @@ No user table or password hashing is ever built. Messages from the queue are a t
 - **Authentication** is not implemented ([section 12](#12-authentication-2)).
 - **Scope.** Partial reversals are out of scope, as §7 (rule 5) allows.
 - **Rules in two places.** The reference rules exist in the domain and, as a backstop, in the schema's deferred checks; changing one means a migration for the other.
-- **Identifier limits.** Provider ids are capped at 64 characters, external, player, round and game ids at 128, idempotency keys at 255, and the schema enforces these lengths (an identifier is never empty). The use cases check them again before any lock, so a broken identifier is a 400, never a database error. They also refuse control characters and unpaired surrogates, which the schema does not check: MikroORM writes values into the SQL text, where a NUL would end the protocol message early and read as an unavailable database, and UTF-8 would store an unpaired surrogate as U+FFFD, merging distinct ids. The API validation mirrors these rules.
+- **Identifier limits.** Provider ids are capped at 64 characters, external, player, round and game ids at 128, idempotency keys at 255, and the schema enforces these lengths (an identifier is never empty). The use cases check them again before any lock, so a broken identifier is a 400, never a database error. They also refuse control characters and unpaired surrogates, which the schema does not check: MikroORM writes values into the SQL text, where a NUL would end the protocol message early and read as an unavailable database, and UTF-8 would store an unpaired surrogate as U+FFFD, merging distinct ids. They refuse U+FFFE and U+FFFF as well: SQS refuses them in a message, so an event carrying one could never be published and would hold back the later events of its wallet. The API validation mirrors these rules.
 - **Lowercase UUIDs only.** RFC 9562 treats UUIDs as case-insensitive on input, but the service accepts the ids it issues only in their canonical lowercase form: an uppercase UUID is refused on input (400, or the DLQ from the queue) and matches nothing on lookup (404). Clients echo the ids they received, and accepting both forms would mean normalizing every id before hashing and comparing it.
 
 ## 17. Open points
 
 A decision that this document and the statement do not cover is listed here and settled with the maintainer before the related code is written, then recorded here and in AGENTS.md.
 
-- **HTTP status of a `FAILED` transaction**, to settle before the HTTP API: [section 11](#11-http-api-9) maps `PROCESSED`, `PENDING_REFERENCE` and `REJECTED`, but a replay of its idempotency key or a lookup can also return a `FAILED` transaction.
-- **What the consumer does with an unexpected error**, to settle before the SQS consumer: [section 9](#9-messaging-10-11) classifies business rejections, transient errors and permanent ones, but not a bug (a schema guard violation, a duplicate key left after the retry, anything that would be a 500 over HTTP). It can count as transient (visibility backoff, 5 receives, then the DLQ) or go straight to the DLQ. Nothing is committed in either case.
+None at the moment. The two last ones were settled with the maintainer before the interfaces were written: a `FAILED` transaction answers 422 on a replay and 200 on a lookup ([section 11](#11-http-api-9)), and the consumer retries an unexpected error like a transient one, which the redrive policy ends in the DLQ ([section 9](#9-messaging-10-11)). So were two more choices of that step: conflicts from the queue go straight to the DLQ, and the crash between commit and acknowledgement is tested with a test-only delay rather than simulated.

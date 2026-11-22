@@ -14,6 +14,21 @@ export interface RequestContext {
 
 export const requestContext = new AsyncLocalStorage<RequestContext>();
 
+/** The correlation id of the request or message being handled; a new one outside any context. */
+export function currentCorrelationId(): string {
+  return requestContext.getStore()?.correlationId ?? Bun.randomUUIDv7();
+}
+
+/** Adds identifiers to the current context, so every later log line of it carries them. */
+export function annotateContext(
+  identifiers: Pick<RequestContext, "messageId" | "transactionId" | "walletId" | "providerId">,
+): void {
+  const store = requestContext.getStore();
+  if (store !== undefined) {
+    Object.assign(store, identifiers);
+  }
+}
+
 export const CORRELATION_ID_HEADER = "x-correlation-id";
 
 const CORRELATION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;

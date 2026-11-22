@@ -127,8 +127,11 @@ export type DuplicateKey =
   | "other";
 
 /**
- * A concurrent transaction committed the same unique key first. Never reaches a caller: the
- * use case runs once more, finds the committed row, and answers from it.
+ * A unique key was violated, named by its meaning. The use cases resolve the keys a concurrent
+ * request can win from the winner's committed row: submit runs once more and finds it, an
+ * opening reads the existing wallet. The reversal index gets a single retry too, as a backstop.
+ * A violation left after that retry is a bug: submit lets it propagate (500), and reprocessing
+ * marks the transaction FAILED.
  */
 export class DuplicateKeyError extends Error {
   override readonly name = "DuplicateKeyError";

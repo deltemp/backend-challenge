@@ -4,6 +4,7 @@ import {
   TransactionNotFoundError,
   WalletNotFoundError,
 } from "../../src/application/errors";
+import type { UnitOfWork } from "../../src/application/ports/unit-of-work";
 import { ledgerDiscrepancies } from "../support/ledger";
 import {
   openUseCaseHarness,
@@ -11,6 +12,11 @@ import {
   transactionCommand,
   type UseCaseHarness,
 } from "../support/use-cases";
+
+/** Fails if reached: a query by an id that can match nothing must not run any SQL. */
+const UNREACHABLE: UnitOfWork = {
+  run: () => Promise.reject(new Error("the query reached the database")),
+};
 
 describe("queries and reconciliation", () => {
   let harness: UseCaseHarness | undefined;
@@ -85,24 +91,52 @@ describe("queries and reconciliation", () => {
 
   test("an id that is not a UUID matches nothing, without reaching the database", async () => {
     const { useCases } = setup();
+    const unreachable = setup().variant({ wrapUnitOfWork: () => UNREACHABLE });
 
-    await expect(useCases.getWallet.execute({ walletId: "wallet-1" })).rejects.toBeInstanceOf(
-      WalletNotFoundError,
-    );
-    await expect(useCases.getWalletLedger.execute({ walletId: "wallet-1" })).rejects.toBeInstanceOf(
-      WalletNotFoundError,
-    );
-    await expect(useCases.reconcileWallet.execute({ walletId: "1; drop" })).rejects.toBeInstanceOf(
+    await expect(unreachable.getWallet.execute({ walletId: "wallet-1" })).rejects.toBeInstanceOf(
       WalletNotFoundError,
     );
     await expect(
-      useCases.getWagerTransaction.byId({ transactionId: "txn-1" }),
+      unreachable.getWalletLedger.execute({ walletId: "wallet-1" }),
+    ).rejects.toBeInstanceOf(WalletNotFoundError);
+    await expect(
+      unreachable.reconcileWallet.execute({ walletId: "1; drop" }),
+    ).rejects.toBeInstanceOf(WalletNotFoundError);
+    await expect(
+      unreachable.getWagerTransaction.byId({ transactionId: "txn-1" }),
     ).rejects.toBeInstanceOf(TransactionNotFoundError);
     // Only the canonical lowercase form names a wallet.
     const wallet = await openWallet(useCases, "1.00");
     await expect(
-      useCases.getWallet.execute({ walletId: wallet.id.toUpperCase() }),
+      unreachable.getWallet.execute({ walletId: wallet.id.toUpperCase() }),
     ).rejects.toBeInstanceOf(WalletNotFoundError);
+  });
+
+  test("a provider identifier the use cases refuse matches nothing, without reaching the database", async () => {
+    const { useCases } = setup();
+    const unreachable = setup().variant({ wrapUnitOfWork: () => UNREACHABLE });
+    const wallet = await openWallet(useCases, "100.00");
+    const command = transactionCommand(wallet, { kind: "BET" });
+    await useCases.submitWagerTransaction.execute(command);
+    const { providerId, externalTransactionId } = command;
+    // Values are written into the SQL text, where a NUL would end the protocol message early.
+    const withNul = { providerId, externalTransactionId: `${externalTransactionId}\u0000` };
+
+    await expect(useCases.getWagerTransaction.byExternalId(withNul)).rejects.toBeInstanceOf(
+      TransactionNotFoundError,
+    );
+    for (const lookup of [
+      withNul,
+      { providerId, externalTransactionId: "" },
+      { providerId, externalTransactionId: "x".repeat(129) },
+      { providerId: "p".repeat(65), externalTransactionId },
+      { providerId: `${providerId}\n`, externalTransactionId },
+      { providerId, externalTransactionId: `${externalTransactionId}\ud800` },
+    ]) {
+      await expect(unreachable.getWagerTransaction.byExternalId(lookup)).rejects.toBeInstanceOf(
+        TransactionNotFoundError,
+      );
+    }
   });
 
   test("a transaction is found by its id and by the provider's id", async () => {

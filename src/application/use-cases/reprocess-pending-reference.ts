@@ -1,7 +1,7 @@
 import { WagerTransactionFailed } from "../../domain/events/events";
 import type { ReferenceRetryPolicy } from "../../domain/wagering/wager-rules";
 import { WagerTransactionStatus } from "../../domain/wagering/wager-transaction";
-import { DuplicateKeyError, TransientError, WalletBusyError } from "../errors";
+import { DuplicateKeyError, TransientError } from "../errors";
 import { decisionEvents, enqueueEvents, eventContexts } from "../integration-events";
 import type { Clock } from "../ports/clock";
 import type { IdGenerator } from "../ports/id-generator";
@@ -37,7 +37,7 @@ export type ReprocessResult =
  * schedules the next attempt. The wallet is locked first (skipped when another transaction holds
  * it) and the transaction read again under that lock, so concurrent workers never apply it
  * twice. An unexpected, non-transient error marks it FAILED, with its event; a transient one
- * leaves it parked for a later attempt.
+ * leaves it parked for a later attempt. A violation of the reversal index runs it once more.
  */
 export class ReprocessPendingReference {
   constructor(
@@ -49,19 +49,39 @@ export class ReprocessPendingReference {
 
   async execute(command: ReprocessPendingReferenceCommand): Promise<ReprocessResult> {
     try {
-      return await this.unitOfWork.run((repositories) => this.reprocess(repositories, command));
+      return await this.attempt(command);
     } catch (error) {
-      // Transient failures leave the transaction parked; the worker comes back. A lost race on
-      // the reversal index is contention, reported the same way. Anything else, including any
-      // other duplicate key, is a bug.
-      if (error instanceof TransientError) {
-        throw error;
+      if (!(error instanceof DuplicateKeyError && error.key === "reversal")) {
+        return await this.recover(command, error);
       }
-      if (error instanceof DuplicateKeyError && error.key === "reversal") {
-        throw new WalletBusyError({ cause: error });
-      }
-      return await this.fail(command, error);
     }
+    // Every reversal runs under the lock of its reference's wallet and looks for an earlier one
+    // first, so this violation is no genuine race. Running once more settles it either way: a
+    // reversal committed in between is now seen and rejects this one, and a second violation is
+    // a bug, which ends FAILED. Left parked, it would fail the same way at every attempt.
+    try {
+      return await this.attempt(command);
+    } catch (error) {
+      return await this.recover(command, error);
+    }
+  }
+
+  private attempt(command: ReprocessPendingReferenceCommand): Promise<ReprocessResult> {
+    return this.unitOfWork.run((repositories) => this.reprocess(repositories, command));
+  }
+
+  /**
+   * A transient failure leaves the transaction parked for the worker's next round; anything
+   * else, any duplicate key included, is a bug and marks it FAILED.
+   */
+  private async recover(
+    command: ReprocessPendingReferenceCommand,
+    error: unknown,
+  ): Promise<ReprocessResult> {
+    if (error instanceof TransientError) {
+      throw error;
+    }
+    return this.fail(command, error);
   }
 
   private async reprocess(

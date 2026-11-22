@@ -4,9 +4,17 @@ import {
   WalletAlreadyExistsError,
   WalletNotFoundError,
 } from "../../src/application/errors";
+import type { Repositories } from "../../src/application/ports/repositories";
+import type { UnitOfWork } from "../../src/application/ports/unit-of-work";
 import { InvalidMoneyError } from "../../src/domain/shared/errors";
 import { ledgerDiscrepancies } from "../support/ledger";
-import { openUseCaseHarness, outboxRows, type UseCaseHarness } from "../support/use-cases";
+import {
+  deferred,
+  openUseCaseHarness,
+  openWallet,
+  outboxRows,
+  type UseCaseHarness,
+} from "../support/use-cases";
 
 describe("OpenWallet and GetWallet", () => {
   let harness: UseCaseHarness | undefined;
@@ -128,6 +136,42 @@ describe("OpenWallet and GetWallet", () => {
     }
   });
 
+  // The owner's unique key is the backstop when two openings both find no wallet. Deterministic:
+  // the loser pauses right before its insert while the winner commits, so the insert must fail.
+  test("an opening that loses the owner's unique key answers with the winner's wallet", async () => {
+    const { useCases, sql } = setup();
+    // The funding account exists before the race, as after any first opening. Otherwise the paused
+    // loser would hold its creation uncommitted, and the winner would wait for the loser.
+    await openWallet(useCases, "1.00");
+    const command = {
+      playerId: `player-${Bun.randomUUIDv7()}`,
+      initialBalance: { amount: "50.00", currency: "BRL" },
+      correlationId: "c",
+    };
+    const gate = deferred();
+    const paused = deferred();
+    const racing = setup().variant({
+      wrapUnitOfWork: pausingFirstWalletInsert(gate.promise, paused.resolve),
+    });
+
+    const loser = racing.openWallet.execute(command).catch((error: unknown) => error);
+    await paused.promise;
+    try {
+      const winner = await useCases.openWallet.execute(command);
+      gate.resolve();
+
+      const refused = await loser;
+      expect(refused).toBeInstanceOf(WalletAlreadyExistsError);
+      expect(refused).toMatchObject({ walletId: winner.id });
+      const [row] = await sql`
+        select count(*)::int as wallets from wallets where player_id = ${command.playerId}`;
+      expect(row).toEqual({ wallets: 1 });
+    } finally {
+      // Never leave the loser's transaction open, whatever happened to the winner.
+      gate.resolve();
+    }
+  });
+
   test("a player id the schema would refuse is a validation error", async () => {
     const { useCases } = setup();
 
@@ -173,3 +217,36 @@ describe("OpenWallet and GetWallet", () => {
     ).rejects.toBeInstanceOf(WalletNotFoundError);
   });
 });
+
+/**
+ * The first unit of work stops right before it inserts the wallet, after the owner lookup found
+ * nothing, and resumes once `gate` opens: another opening can commit in between.
+ */
+function pausingFirstWalletInsert(gate: Promise<void>, onPaused: () => void) {
+  let paused = false;
+  return (inner: UnitOfWork): UnitOfWork => ({
+    run: <T>(work: (repositories: Repositories) => Promise<T>) =>
+      inner.run((repositories) => {
+        if (paused) {
+          return work(repositories);
+        }
+        paused = true;
+        const { wallets } = repositories;
+        return work({
+          ...repositories,
+          wallets: {
+            lock: (id) => wallets.lock(id),
+            lockIfFree: (id) => wallets.lockIfFree(id),
+            find: (id) => wallets.find(id),
+            findIdByOwner: (playerId, currency) => wallets.findIdByOwner(playerId, currency),
+            save: (wallet) => wallets.save(wallet),
+            add: async (wallet) => {
+              onPaused();
+              await gate;
+              await wallets.add(wallet);
+            },
+          },
+        });
+      }),
+  });
+}

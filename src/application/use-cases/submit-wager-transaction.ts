@@ -16,7 +16,6 @@ import {
   ExternalTransactionConflictError,
   IdempotencyConflictError,
   InboxConflictError,
-  WalletBusyError,
   WalletNotFoundError,
 } from "../errors";
 import { decisionEvents, enqueueEvents, eventContexts } from "../integration-events";
@@ -58,7 +57,10 @@ export interface SubmitWagerTransactionResult {
   readonly duplicateMessage: boolean;
 }
 
-/** Unique keys a concurrent copy of the same request can win; the second run answers from it. */
+/**
+ * Unique keys the first run may lose to a concurrent copy on another wallet, and the reversal
+ * index as a backstop no copy can win; the second run answers from the winner's row.
+ */
 const RACES: ReadonlySet<DuplicateKey> = new Set<DuplicateKey>([
   "idempotency-key",
   "external-transaction",
@@ -119,13 +121,10 @@ export class SubmitWagerTransaction {
         throw error;
       }
     }
-    // A concurrent copy committed the same key first: run once more and answer from its row.
-    try {
-      return await this.attempt(request, build());
-    } catch (error) {
-      // Lost a second race too: contention, and nothing was committed. Resending is safe.
-      throw isRace(error) ? new WalletBusyError({ cause: error }) : error;
-    }
+    // A concurrent copy committed the same key first: run once more and answer from its row. The
+    // lookups now find that row before any insert, so a violation on this run is no contention
+    // but a bug: it propagates (500), with nothing committed.
+    return this.attempt(request, build());
   }
 
   private attempt(
@@ -213,7 +212,10 @@ function isRace(error: unknown): error is DuplicateKeyError {
   return error instanceof DuplicateKeyError && RACES.has(error.key);
 }
 
-/** Validates what the schema would refuse, and computes the payload hash. */
+/**
+ * Validates what the use cases refuse before any lock (AGENTS.md, "Validation comes before any
+ * lock"), and computes the payload hash.
+ */
 function parse(command: SubmitWagerTransactionCommand): ParsedRequest {
   new RequestCheck()
     .identifier("providerId", command.providerId)

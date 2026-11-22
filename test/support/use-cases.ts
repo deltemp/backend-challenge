@@ -117,6 +117,15 @@ export async function openUseCaseHarness(options: HarnessOptions = {}): Promise<
   }
 }
 
+/** A promise and the function that settles it, to order two requests deterministically. */
+export function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+  let resolve: () => void = () => {};
+  const promise = new Promise<void>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 export async function openWallet(
   useCases: UseCases,
   amount = "100.00",

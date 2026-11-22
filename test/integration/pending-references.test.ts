@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { DependencyUnavailableError } from "../../src/application/errors";
+import { DependencyUnavailableError, DuplicateKeyError } from "../../src/application/errors";
 import type { Repositories } from "../../src/application/ports/repositories";
 import type { UnitOfWork } from "../../src/application/ports/unit-of-work";
 import type { WalletView } from "../../src/application/views";
@@ -186,7 +186,7 @@ describe("FindDuePendingReferences and ReprocessPendingReference", () => {
     const refund = await park(wallet, "REFUND", `bet-${wallet.id}`);
     await bet(wallet, `bet-${wallet.id}`);
     clock.advance(1000);
-    const faulty = setup().variant({ wrapUnitOfWork: (inner) => failingOnce(inner) });
+    const faulty = setup().variant({ wrapUnitOfWork: (inner) => failingLedger(inner) });
 
     const result = await faulty.reprocessPendingReference.execute({
       transactionId: refund.id,
@@ -210,7 +210,8 @@ describe("FindDuePendingReferences and ReprocessPendingReference", () => {
     clock.advance(1000);
     // The first attempt loses the database while writing; the next one is real.
     const flaky = setup().variant({
-      wrapUnitOfWork: (inner) => failingOnce(inner, () => new DependencyUnavailableError()),
+      wrapUnitOfWork: (inner) =>
+        failingLedger(inner, { failure: () => new DependencyUnavailableError() }),
     });
 
     await expect(
@@ -227,14 +228,88 @@ describe("FindDuePendingReferences and ReprocessPendingReference", () => {
     expect(await balanceOf(sql, wallet.id)).toBe("75.00");
     expect((await reprocess(refund.id)).status).toBe("processed");
   });
+
+  /** A parked REFUND whose BET has arrived, due for its next attempt. */
+  async function dueRefund() {
+    const wallet = await openWallet(setup().useCases, "100.00");
+    const refund = await park(wallet, "REFUND", `bet-${wallet.id}`);
+    await bet(wallet, `bet-${wallet.id}`);
+    clock.advance(1000);
+    return { wallet, refund };
+  }
+
+  test("a violation of the reversal index runs the transaction once more, in the same call", async () => {
+    const { sql } = setup();
+    const { wallet, refund } = await dueRefund();
+    const racing = setup().variant({
+      wrapUnitOfWork: (inner) =>
+        failingLedger(inner, { failure: () => new DuplicateKeyError("reversal") }),
+    });
+
+    const result = await racing.reprocessPendingReference.execute({
+      transactionId: refund.id,
+      correlationId: "retry-worker",
+    });
+
+    expect(result).toMatchObject({ status: "processed", transaction: { status: "PROCESSED" } });
+    expect(await balanceOf(sql, wallet.id)).toBe("100.00");
+  });
+
+  // The wallet lock rules out a genuine race on the reversal index, so a second violation can
+  // only be a bug. Left parked, the transaction would fail the same way at every attempt, forever.
+  test("a second violation of the reversal index is a bug: the transaction ends FAILED", async () => {
+    const { sql } = setup();
+    const { wallet, refund } = await dueRefund();
+    const broken = setup().variant({
+      wrapUnitOfWork: (inner) =>
+        failingLedger(inner, { failure: () => new DuplicateKeyError("reversal"), times: 2 }),
+    });
+
+    const result = await broken.reprocessPendingReference.execute({
+      transactionId: refund.id,
+      correlationId: "retry-worker",
+    });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      transaction: { status: "FAILED", failureCode: "INTERNAL_ERROR" },
+      error: expect.any(DuplicateKeyError),
+    });
+    expect((await outboxRows(sql, wallet.id)).at(-1)?.eventType).toBe("WagerTransactionFailed");
+    expect(await balanceOf(sql, wallet.id)).toBe("75.00");
+  });
+
+  test("any other duplicate key is a bug: the transaction ends FAILED", async () => {
+    const { sql } = setup();
+    const { wallet, refund } = await dueRefund();
+    const broken = setup().variant({
+      wrapUnitOfWork: (inner) =>
+        failingLedger(inner, { failure: () => new DuplicateKeyError("other") }),
+    });
+
+    const result = await broken.reprocessPendingReference.execute({
+      transactionId: refund.id,
+      correlationId: "retry-worker",
+    });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      transaction: { status: "FAILED", failureCode: "INTERNAL_ERROR" },
+    });
+    expect(await storedTransaction(refund.id)).toMatchObject({ status: "FAILED" });
+    expect(await balanceOf(sql, wallet.id)).toBe("75.00");
+  });
 });
 
-/** The first unit of work fails while writing the ledger; later ones run as they are. */
-function failingOnce(
+/** The first `times` units of work fail while writing the ledger; later ones run as they are. */
+function failingLedger(
   inner: UnitOfWork,
-  failure: () => Error = () => new Error("the disk is on fire"),
+  {
+    failure = () => new Error("the disk is on fire"),
+    times = 1,
+  }: { readonly failure?: () => Error; readonly times?: number } = {},
 ): UnitOfWork {
-  let failures = 1;
+  let failures = times;
   return {
     run: <T>(work: (repositories: Repositories) => Promise<T>) =>
       inner.run((repositories) => {

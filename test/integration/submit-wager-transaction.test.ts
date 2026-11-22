@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import {
+  DuplicateKeyError,
   ExternalTransactionConflictError,
   IdempotencyConflictError,
   InboxConflictError,
@@ -7,7 +8,10 @@ import {
   WalletBusyError,
   WalletNotFoundError,
 } from "../../src/application/errors";
-import type { Repositories } from "../../src/application/ports/repositories";
+import type {
+  Repositories,
+  WagerTransactionRepository,
+} from "../../src/application/ports/repositories";
 import type { UnitOfWork } from "../../src/application/ports/unit-of-work";
 import type { SubmitWagerTransactionCommand } from "../../src/application/use-cases/submit-wager-transaction";
 import { InvalidWagerTransactionError } from "../../src/domain/shared/errors";
@@ -16,6 +20,7 @@ import { cleanUp } from "../support/cleanup";
 import { ledgerDiscrepancies } from "../support/ledger";
 import {
   balanceOf,
+  deferred,
   openUseCaseHarness,
   openWallet,
   outboxRows,
@@ -310,6 +315,8 @@ describe("SubmitWagerTransaction", () => {
       { externalTransactionId: "x".repeat(129) },
       // PostgreSQL text cannot hold NUL; no identifier needs a control character.
       { roundId: "round\u0000-1" },
+      // UTF-8 would store an unpaired surrogate as U+FFFD, merging distinct ids into one.
+      { idempotencyKey: "key-\ud800" },
       // The canonical form only: an uppercase id would find the row, then differ from it.
       { walletId: wallet.id.toUpperCase() },
     ]) {
@@ -329,15 +336,6 @@ describe("SubmitWagerTransaction", () => {
   });
 });
 
-/** A promise and the function that settles it, to order two requests deterministically. */
-function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
-  let resolve: () => void = () => {};
-  const promise = new Promise<void>((settle) => {
-    resolve = settle;
-  });
-  return { promise, resolve };
-}
-
 /**
  * The first unit of work stops right before it writes its transaction, after every lookup has
  * found nothing, and resumes once `gate` opens: another request can commit in between.
@@ -354,24 +352,47 @@ function pausingFirstInsert(gate: Promise<void>, onPaused: () => void) {
         const { transactions } = repositories;
         return work({
           ...repositories,
-          transactions: {
-            find: (id) => transactions.find(id),
-            findByIdempotencyKey: (key) => transactions.findByIdempotencyKey(key),
-            findByExternalId: (providerId, externalId) =>
-              transactions.findByExternalId(providerId, externalId),
-            isReversed: (id) => transactions.isReversed(id),
-            findDuePendingReferences: (now, limit) =>
-              transactions.findDuePendingReferences(now, limit),
-            save: (transaction) => transactions.save(transaction),
-            add: async (transaction) => {
-              onPaused();
-              await gate;
-              await transactions.add(transaction);
-            },
-          },
+          transactions: withInsert(transactions, async (transaction) => {
+            onPaused();
+            await gate;
+            await transactions.add(transaction);
+          }),
         });
       }),
   });
+}
+
+/**
+ * Every unit of work fails as it writes its transaction, as a unique index out of step with the
+ * lookups would.
+ */
+function failingInserts(failure: () => Error) {
+  return (inner: UnitOfWork): UnitOfWork => ({
+    run: <T>(work: (repositories: Repositories) => Promise<T>) =>
+      inner.run((repositories) =>
+        work({
+          ...repositories,
+          transactions: withInsert(repositories.transactions, () => Promise.reject(failure())),
+        }),
+      ),
+  });
+}
+
+/** The repository as it is, except for how it inserts a transaction. */
+function withInsert(
+  transactions: WagerTransactionRepository,
+  add: WagerTransactionRepository["add"],
+): WagerTransactionRepository {
+  return {
+    find: (id) => transactions.find(id),
+    findByIdempotencyKey: (key) => transactions.findByIdempotencyKey(key),
+    findByExternalId: (providerId, externalId) =>
+      transactions.findByExternalId(providerId, externalId),
+    isReversed: (id) => transactions.isReversed(id),
+    findDuePendingReferences: (now, limit) => transactions.findDuePendingReferences(now, limit),
+    save: (transaction) => transactions.save(transaction),
+    add,
+  };
 }
 
 // The unique constraints are the backstop for races the wallet lock does not serialize: copies
@@ -490,6 +511,34 @@ describe("SubmitWagerTransaction when a concurrent request wins a unique key", (
       where external_transaction_id = ${externalTransactionId}`;
     expect(row).toEqual({ stored: 1 });
     expect(await balanceOf(sql, first.id)).toBe("100.00");
+  });
+
+  // The second run looks the winner's row up before inserting, so a violation on it is no
+  // contention: only a bug, such as a unique index out of step with the lookups, gets there.
+  test("a violation on the second run is a bug: it propagates, with nothing committed", async () => {
+    const { useCases, sql } = setup();
+    const wallet = await openWallet(useCases);
+    const command = transactionCommand(wallet, { kind: "BET" });
+    let inserts = 0;
+    const broken = setup().variant({
+      wrapUnitOfWork: failingInserts(() => {
+        inserts += 1;
+        return new DuplicateKeyError("idempotency-key");
+      }),
+    });
+
+    const error = await broken.submitWagerTransaction
+      .execute(command)
+      .catch((failure: unknown) => failure);
+
+    expect(error).toBeInstanceOf(DuplicateKeyError);
+    // The first run and exactly one more.
+    expect(inserts).toBe(2);
+    const [row] = await sql`
+      select count(*)::int as stored from wager_transactions
+      where external_transaction_id = ${command.externalTransactionId}`;
+    expect(row).toEqual({ stored: 0 });
+    expect(await balanceOf(sql, wallet.id)).toBe("100.00");
   });
 });
 

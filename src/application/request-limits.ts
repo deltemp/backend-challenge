@@ -20,27 +20,45 @@ export const IDENTIFIER_LIMITS = {
 // Lowercase only: the canonical form this service issues and PostgreSQL returns. An uppercase
 // id would find its row and then differ, as a string, from the id read back.
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-// PostgreSQL text cannot hold NUL, and no identifier needs any control character.
-const CONTROL_CHARACTER = /\p{Cc}/u;
+// No identifier needs a control character, and PostgreSQL text cannot hold NUL. MikroORM writes
+// values into the SQL text, where a NUL would even end the protocol message early (08P01). An
+// unpaired surrogate is not text at all: encoded as UTF-8 it becomes U+FFFD, so two different
+// ids would be stored as the same one. The schema checks neither; only the use cases write ids.
+const UNSUPPORTED_CHARACTER = /[\p{Cc}\p{Cs}]/u;
+
+type IdentifierPath = keyof typeof IDENTIFIER_LIMITS;
 
 /** Ids the application generates are lowercase UUIDs; anything else can match no row. */
 export function isUuid(value: string): boolean {
   return UUID.test(value);
 }
 
+/**
+ * Whether the use cases accept the value as this identifier. They never stored a value they
+ * refuse, so a refused value matches no row.
+ */
+export function isIdentifier(path: IdentifierPath, value: string): boolean {
+  return identifierIssue(path, value) === undefined;
+}
+
+function identifierIssue(path: IdentifierPath, value: string): string | undefined {
+  const max = IDENTIFIER_LIMITS[path];
+  if (value.length === 0 || value.length > max) {
+    return `must have 1 to ${max} characters`;
+  }
+  return UNSUPPORTED_CHARACTER.test(value)
+    ? "must not contain control characters or unpaired surrogates"
+    : undefined;
+}
+
 /** Collects every broken rule of a request, then throws them together. */
 export class RequestCheck {
   private readonly issues: ValidationIssue[] = [];
 
-  identifier(path: keyof typeof IDENTIFIER_LIMITS, value: string | undefined): this {
-    const max = IDENTIFIER_LIMITS[path];
-    if (value === undefined) {
-      return this;
-    }
-    if (value.length === 0 || value.length > max) {
-      this.issues.push({ path, message: `must have 1 to ${max} characters` });
-    } else if (CONTROL_CHARACTER.test(value)) {
-      this.issues.push({ path, message: "must not contain control characters" });
+  identifier(path: IdentifierPath, value: string | undefined): this {
+    const message = value === undefined ? undefined : identifierIssue(path, value);
+    if (message !== undefined) {
+      this.issues.push({ path, message });
     }
     return this;
   }

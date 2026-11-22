@@ -2,7 +2,7 @@ import type { MoneyProps } from "../../domain/money/money";
 import { TransactionNotFoundError, WalletNotFoundError } from "../errors";
 import { decodeLedgerCursor, encodeLedgerCursor } from "../ledger-cursor";
 import type { UnitOfWork } from "../ports/unit-of-work";
-import { isUuid } from "../request-limits";
+import { isIdentifier, isUuid } from "../request-limits";
 import {
   type LedgerEntryView,
   ledgerEntryView,
@@ -99,6 +99,12 @@ export class GetWagerTransaction {
     readonly providerId: string;
     readonly externalTransactionId: string;
   }): Promise<WagerTransactionView> {
+    if (
+      !isIdentifier("providerId", query.providerId) ||
+      !isIdentifier("externalTransactionId", query.externalTransactionId)
+    ) {
+      throw new TransactionNotFoundError();
+    }
     const transaction = await this.unitOfWork.run(({ transactions }) =>
       transactions.findByExternalId(query.providerId, query.externalTransactionId),
     );

@@ -141,5 +141,5 @@ Bun loads `.env` automatically for processes started on the host. Containers get
 ## Documentation
 
 - [docs/CHALLENGE.md](docs/CHALLENGE.md): the challenge statement.
-- `ARCHITECTURE.md`: decisions, trade-offs and limitations (not written yet).
+- [ARCHITECTURE.md](ARCHITECTURE.md): decisions and their rationale, trade-offs, limitations and open points.
 - [AGENTS.md](AGENTS.md): working conventions for contributors and AI coding agents.

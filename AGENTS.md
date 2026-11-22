@@ -7,7 +7,7 @@ Working instructions for AI coding agents and human contributors. This file is t
 Solution to Jungle Gaming's backend challenge, "Distributed Wagering Processor": a distributed financial service that processes wagering transactions (`BET → WIN | LOSS | REFUND | ROLLBACK`) from multiple game providers over HTTP and SQS. Delivery is at-least-once: assume duplicates, out-of-order arrival, concurrent instances, crashes before or after commit, and temporary PostgreSQL or SQS outages.
 
 - **Requirements:** `docs/CHALLENGE.md`, the original statement in Portuguese. Never edit or translate it. `§N` below refers to its sections.
-- **Decisions and rationale:** `ARCHITECTURE.md` (required deliverable, not written yet).
+- **Decisions and rationale:** `ARCHITECTURE.md`, a required deliverable. It holds the reasoning behind the rules in this file; keep both in sync.
 - **Status: scaffolded.** Configuration, logging, metrics, health checks, migration tooling, queue provisioning, the Compose stack and the test harness exist. The domain (`src/domain`, `src/application`) and every business feature do not exist yet. Keep "Commands" and "Layout" in line with reality, in the same change that alters them.
 
 ### What is graded (§14)
@@ -136,6 +136,7 @@ The class skeletons in §6 and §11 are the reference. Names may be adapted; gua
 - `rehydrate` rebuilds persisted state and never revalidates transitions. Only repositories call it.
 - State is private and changes only through explicit transition methods. Transitioning a terminal transaction (`PROCESSED`, `REJECTED`, `FAILED`) throws `InvalidTransactionStateError`: that is a programming error, not a business path.
 - `Money` is immutable. It accepts decimal strings with up to 2 decimal places, always serializes with exactly 2, and never rounds. `NaN`, `Infinity`, scientific notation, empty strings, more than 2 decimals, and negative amounts in input contracts are rejected. Operations across currencies throw a domain error.
+- `Money` persists as `NUMERIC(20,2)` plus `CHAR(3)` and is rehydrated as `Money`. decimal.js defaults to 20 significant digits, which is not enough to add two amounts at the limit of `NUMERIC(20,2)` exactly, so `Money` uses its own decimal.js configuration with more precision, and rejects amounts outside that range.
 - `WalletLedgerEntry` is structurally immutable: every field `readonly`, no transition methods. Its factory validates `balanceBefore ± money == balanceAfter`.
 - Integration events extend the abstract `IntegrationEvent<T>`, with one concrete subclass per event and `eventType` and `version` declared on the class, never as strings at the call site. Event `data` carries `MoneyProps` (decimal strings), never a `Money` instance.
 - Use `interface` for plain data shapes (props, DTOs, state) and classes for behavior.
@@ -172,8 +173,8 @@ Each of these was decided with the maintainer. Implement them as written; if one
 
 ### Idempotency (§9)
 
-- The `Idempotency-Key` header is mandatory and authoritative. `payloadHash` is the SHA-256 (hex) of the RFC 8785 canonical JSON of the business fields, with money normalized to scale 2. Headers and transport metadata are not hashed.
-- Same key with the same hash is a replay (`idempotentReplay: true`). Same key with a different hash is a conflict, never a replay.
+- The `Idempotency-Key` header is mandatory and authoritative. `payloadHash` is the SHA-256 (hex) of the RFC 8785 canonical JSON of the business fields: `providerId`, `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`, `money` and, when present, `referenceExternalTransactionId`, with money normalized to scale 2. The idempotency key, headers and transport metadata (`messageId`, `occurredAt`, message type) are not hashed.
+- Same key with the same hash is a replay (`idempotentReplay: true`). Same key with a different hash is a conflict, never a replay. As a consequence, a rejection is final for its key: a corrected payload must come as a new transaction, with a new `externalTransactionId`.
 
 ### HTTP contract (§9)
 
@@ -191,6 +192,8 @@ Each of these was decided with the maintainer. Implement them as written; if one
 Protocol errors use RFC 9457 `application/problem+json` with a stable, machine-readable `code`. The mapping is identical on every endpoint. Health endpoints never require authentication.
 
 `GET /wallets/:walletId/ledger` paginates by `wallet_version`. The cursor is that number encoded in base64url, and it is opaque to clients.
+
+`POST /wallets/:walletId/reconciliation` reads the stored balance and the wallet's ledger in one consistent snapshot, so concurrent transactions cannot produce false divergences. A divergence is logged, counted in a metric and flagged in the response, never corrected.
 
 ### Messaging (§10, §11)
 
@@ -279,3 +282,6 @@ Not decided yet. Raise each one with the maintainer before implementing the rela
 
 - Ordering of published events: concurrent publishers using `SKIP LOCKED` can publish one wallet's events out of order. Either document it as a limitation (consumers order by `walletVersion`) or claim outbox rows per wallet.
 - Base and cap of the visibility-timeout backoff for the inbound queue. Constraint: the time a message can spend in retries before reaching the DLQ must stay below the `PENDING_REFERENCE` TTL, otherwise a reversal can be rejected while its `BET` is still being retried.
+- Values for `statement_timeout` and `lock_timeout`, to be set with the use cases.
+- The list of `code` values in problem+json responses.
+- A reversal whose reference is itself still `PENDING_REFERENCE`: wait in `PENDING_REFERENCE`, or reject with `REFERENCE_NOT_PROCESSED`.

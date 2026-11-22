@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Build, coverage and test output
+dist/
+coverage/
+*.tsbuildinfo
+
+# Environment files hold secrets (LOCALSTACK_AUTH_TOKEN). Only the example is committed.
+.env
+.env.*
+!.env.example
+
+# Claude Code personal overrides
+.claude/settings.local.json
+
+# Logs
+*.log
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+.idea/

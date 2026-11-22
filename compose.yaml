@@ -1,0 +1,130 @@
+name: wagering
+
+# Settings shared by every container that runs the application image.
+x-app-environment: &app-environment
+  NODE_ENV: production
+  LOG_LEVEL: info
+  DATABASE_URL: postgresql://wagering:wagering@postgres:5432/wagering
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL: http://localstack:4566
+  # LocalStack accepts any credentials; these are placeholders, not secrets.
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+
+services:
+  postgres:
+    image: postgres:19.0-alpine
+    environment:
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+      POSTGRES_DB: wagering
+    # Tests start several application processes, each with its own connection pool.
+    command: ["postgres", "-c", "max_connections=300"]
+    ports:
+      # 55432 on the host avoids clashing with a locally installed PostgreSQL on 5432.
+      - "${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      # PostgreSQL 18+ images keep their data under /var/lib/postgresql/<major>/.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "wagering", "-d", "wagering"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  localstack:
+    image: localstack/localstack:2026.10.8
+    environment:
+      # Read from .env. Without a valid token LocalStack refuses to start (see README).
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
+      SERVICES: sqs
+    ports:
+      - "${LOCALSTACK_PORT:-4566}:4566"
+    healthcheck:
+      # The image ships without curl; Python is always there, since LocalStack runs on it.
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import json, sys, urllib.request;
+          state = json.load(urllib.request.urlopen("http://localhost:4566/_localstack/health"))["services"].get("sqs");
+          sys.exit(0 if state in ("available", "running") else 1)
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  # One-shot job: applies migrations and creates the SQS queues, then exits.
+  provision:
+    build: .
+    image: wagering-app:local
+    command: ["bun", "scripts/provision.ts"]
+    environment: *app-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+
+  app:
+    build: .
+    image: wagering-app:local
+    init: true
+    # A replica that exits (an unhandled rejection or a shutdown that timed out) comes back.
+    restart: unless-stopped
+    deploy:
+      replicas: 3
+    environment:
+      <<: *app-environment
+      PORT: "3000"
+      APP_ROLES: api,consumer,outbox,retry
+    depends_on:
+      provision:
+        condition: service_completed_successfully
+    # Healthy means ready (PostgreSQL and SQS reachable, inbound queue present), so
+    # `docker compose up --wait` returns only once the stack can serve. Compose never restarts
+    # an unhealthy container, so a dependency outage cannot cause a restart loop.
+    healthcheck:
+      test:
+        - CMD
+        - bun
+        - -e
+        - "const r = await fetch('http://127.0.0.1:3000/health/ready').catch(() => null); process.exit(r?.ok ? 0 : 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    stop_grace_period: 15s
+
+  proxy:
+    image: nginx:1.30.7-alpine
+    ports:
+      - "${APP_PORT:-3000}:80"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+        # nginx resolves the replicas only at startup: restart it when compose recreates them.
+        restart: true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # Load test runner, outside the default stack: bun run test:load
+  k6:
+    image: grafana/k6:2.4.0
+    profiles: ["load"]
+    command: ["run", "/scripts/smoke.js"]
+    environment:
+      BASE_URL: http://proxy
+    volumes:
+      - ./test/load:/scripts:ro
+    depends_on:
+      proxy:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

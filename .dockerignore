@@ -1,0 +1,16 @@
+# Secrets never enter the build context, at any depth.
+.env
+.env.*
+**/.env
+**/.env.*
+
+node_modules
+.git
+.claude
+docs
+test
+coverage
+*.log
+compose.yaml
+Dockerfile
+.dockerignore

@@ -36,8 +36,19 @@ function testDatabase(name: string): TestDatabase {
 }
 
 /** Connection settings for tests that open their own ORM instance (migrations, setup). */
-export function testDatabaseConfig(url: string): DatabaseConfig {
-  return { url, poolMax: 2, connectTimeoutMs: 5000, idleInTransactionTimeoutMs: 30_000 };
+export function testDatabaseConfig(
+  url: string,
+  overrides: Partial<Omit<DatabaseConfig, "url">> = {},
+): DatabaseConfig {
+  return {
+    url,
+    poolMax: 2,
+    connectTimeoutMs: 5000,
+    idleInTransactionTimeoutMs: 30_000,
+    lockTimeoutMs: 2000,
+    statementTimeoutMs: 5000,
+    ...overrides,
+  };
 }
 
 export async function createTemplateDatabase(): Promise<string> {

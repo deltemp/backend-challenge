@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { WageringSettings } from "../../application/policies";
 
 export const APP_ROLES = ["api", "consumer", "outbox", "retry"] as const;
 export type AppRole = (typeof APP_ROLES)[number];
@@ -23,24 +24,54 @@ const fifoQueueName = z
 
 const integer = (min: number, max: number) => z.coerce.number().int().min(min).max(max);
 
-const environmentSchema = z.object({
-  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
-  PORT: integer(0, 65_535).default(3000),
-  APP_ROLES: roleList.prefault(APP_ROLES.join(",")),
-  LOG_LEVEL: z.enum(LOG_LEVELS).default("info"),
-  SHUTDOWN_TIMEOUT_MS: integer(1000, 120_000).default(10_000),
-  HEALTH_CHECK_TIMEOUT_MS: integer(100, 30_000).default(2000),
-  DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/, error: "must be a postgresql:// URL" }),
-  DATABASE_POOL_MAX: integer(1, 100).default(10),
-  DATABASE_CONNECT_TIMEOUT_MS: integer(100, 60_000).default(5000),
-  DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS: integer(1000, 600_000).default(30_000),
-  AWS_REGION: z.string().min(1).default("us-east-1"),
-  AWS_ENDPOINT_URL: z.url({ protocol: /^https?$/, error: "must be an http(s):// URL" }).optional(),
-  SQS_WAGER_TRANSACTIONS_QUEUE: fifoQueueName.default("wager-transactions.fifo"),
-  SQS_WAGER_TRANSACTIONS_DLQ: fifoQueueName.default("wager-transactions-dlq.fifo"),
-  SQS_WAGER_EVENTS_QUEUE: fifoQueueName.default("wager-events.fifo"),
-  SQS_MAX_RECEIVE_COUNT: integer(1, 1000).default(5),
-});
+const environmentSchema = z
+  .object({
+    NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+    PORT: integer(0, 65_535).default(3000),
+    APP_ROLES: roleList.prefault(APP_ROLES.join(",")),
+    LOG_LEVEL: z.enum(LOG_LEVELS).default("info"),
+    SHUTDOWN_TIMEOUT_MS: integer(1000, 120_000).default(10_000),
+    HEALTH_CHECK_TIMEOUT_MS: integer(100, 30_000).default(2000),
+    DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/, error: "must be a postgresql:// URL" }),
+    DATABASE_POOL_MAX: integer(1, 100).default(10),
+    DATABASE_CONNECT_TIMEOUT_MS: integer(100, 60_000).default(5000),
+    DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS: integer(1000, 600_000).default(30_000),
+    DATABASE_LOCK_TIMEOUT_MS: integer(50, 60_000).default(2000),
+    DATABASE_STATEMENT_TIMEOUT_MS: integer(100, 600_000).default(5000),
+    REFERENCE_TTL_MS: integer(1, 86_400_000).default(900_000),
+    REFERENCE_RETRY_BASE_MS: integer(1, 3_600_000).default(1000),
+    REFERENCE_RETRY_CAP_MS: integer(1, 3_600_000).default(60_000),
+    OUTBOX_RETRY_BASE_MS: integer(1, 3_600_000).default(1000),
+    OUTBOX_RETRY_CAP_MS: integer(1, 3_600_000).default(60_000),
+    AWS_REGION: z.string().min(1).default("us-east-1"),
+    AWS_ENDPOINT_URL: z
+      .url({ protocol: /^https?$/, error: "must be an http(s):// URL" })
+      .optional(),
+    SQS_WAGER_TRANSACTIONS_QUEUE: fifoQueueName.default("wager-transactions.fifo"),
+    SQS_WAGER_TRANSACTIONS_DLQ: fifoQueueName.default("wager-transactions-dlq.fifo"),
+    SQS_WAGER_EVENTS_QUEUE: fifoQueueName.default("wager-events.fifo"),
+    SQS_MAX_RECEIVE_COUNT: integer(1, 1000).default(5),
+  })
+  .superRefine((env, context) => {
+    const backoffs = [
+      ["REFERENCE_RETRY_BASE_MS", "REFERENCE_RETRY_CAP_MS"],
+      ["OUTBOX_RETRY_BASE_MS", "OUTBOX_RETRY_CAP_MS"],
+    ] as const;
+    for (const [base, cap] of backoffs) {
+      if (env[cap] < env[base]) {
+        context.addIssue({ code: "custom", path: [cap], message: `must be at least ${base}` });
+      }
+    }
+    // Otherwise a long lock wait ends as a statement timeout: DEPENDENCY_UNAVAILABLE instead
+    // of WALLET_BUSY, and missed by the lock-conflict metric.
+    if (env.DATABASE_LOCK_TIMEOUT_MS >= env.DATABASE_STATEMENT_TIMEOUT_MS) {
+      context.addIssue({
+        code: "custom",
+        path: ["DATABASE_LOCK_TIMEOUT_MS"],
+        message: "must be below DATABASE_STATEMENT_TIMEOUT_MS",
+      });
+    }
+  });
 
 export interface DatabaseConfig {
   readonly url: string;
@@ -52,6 +83,13 @@ export interface DatabaseConfig {
    * releases the row locks of a process that stalled or vanished mid-transaction.
    */
   readonly idleInTransactionTimeoutMs: number;
+  /**
+   * Longest wait for a row lock in the application's sessions; a timeout is a transient error
+   * (`WALLET_BUSY`). Migrations run without it.
+   */
+  readonly lockTimeoutMs: number;
+  /** Longest statement in the application's sessions (`DEPENDENCY_UNAVAILABLE`). */
+  readonly statementTimeoutMs: number;
 }
 
 export interface AwsConfig {
@@ -81,6 +119,7 @@ export interface AppConfig {
   readonly database: DatabaseConfig;
   readonly aws: AwsConfig;
   readonly sqs: SqsConfig;
+  readonly wagering: WageringSettings;
 }
 
 /** Invalid configuration. The message names each variable and the rule it breaks, never its value. */
@@ -140,6 +179,8 @@ export function loadConfig(environment: Readonly<Record<string, string | undefin
       poolMax: env.DATABASE_POOL_MAX,
       connectTimeoutMs: env.DATABASE_CONNECT_TIMEOUT_MS,
       idleInTransactionTimeoutMs: env.DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+      lockTimeoutMs: env.DATABASE_LOCK_TIMEOUT_MS,
+      statementTimeoutMs: env.DATABASE_STATEMENT_TIMEOUT_MS,
     },
     aws: { region: env.AWS_REGION, endpointUrl: env.AWS_ENDPOINT_URL },
     sqs: {
@@ -149,6 +190,11 @@ export function loadConfig(environment: Readonly<Record<string, string | undefin
         wagerEvents: env.SQS_WAGER_EVENTS_QUEUE,
       },
       maxReceiveCount: env.SQS_MAX_RECEIVE_COUNT,
+    },
+    wagering: {
+      referenceTtlMs: env.REFERENCE_TTL_MS,
+      referenceRetry: { baseMs: env.REFERENCE_RETRY_BASE_MS, capMs: env.REFERENCE_RETRY_CAP_MS },
+      outboxRetry: { baseMs: env.OUTBOX_RETRY_BASE_MS, capMs: env.OUTBOX_RETRY_CAP_MS },
     },
   };
 }

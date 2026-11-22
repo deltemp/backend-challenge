@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  WagerTransactionFailed,
   WagerTransactionPendingReference,
   WagerTransactionProcessed,
   WagerTransactionRejected,
@@ -182,6 +183,33 @@ describe("WagerTransactionPendingReference", () => {
         submit({ kind: WagerTransactionKind.Refund, referenceExternalTransactionId: "b" }),
         context,
       ),
+    ).toThrow(InvariantViolationError);
+  });
+});
+
+describe("WagerTransactionFailed", () => {
+  test("carries INTERNAL_ERROR and the balance observed when the transaction was parked", () => {
+    const wallet = openWallet("100.00");
+    const refund = submit({
+      kind: WagerTransactionKind.Refund,
+      referenceExternalTransactionId: "bet-late",
+    });
+    apply(wallet, refund);
+    refund.fail(at(2));
+
+    const event = WagerTransactionFailed.from(refund, context);
+
+    expect(event.eventType).toBe("WagerTransactionFailed");
+    expect(event.orderingKey).toBe(WALLET);
+    expect(event.data).toMatchObject({
+      failureCode: FailureCode.InternalError,
+      balance: { amount: "100.00", currency: "BRL" },
+    });
+  });
+
+  test("is raised only for a FAILED transaction", () => {
+    expect(() =>
+      WagerTransactionFailed.from(submit({ kind: WagerTransactionKind.Bet }), context),
     ).toThrow(InvariantViolationError);
   });
 });

@@ -34,7 +34,34 @@ describe("loadConfig", () => {
       poolMax: 10,
       connectTimeoutMs: 5000,
       idleInTransactionTimeoutMs: 30_000,
+      lockTimeoutMs: 2000,
+      statementTimeoutMs: 5000,
     });
+    expect(config.wagering).toEqual({
+      referenceTtlMs: 900_000,
+      referenceRetry: { baseMs: 1000, capMs: 60_000 },
+      outboxRetry: { baseMs: 1000, capMs: 60_000 },
+    });
+  });
+
+  test("rejects a lock timeout that is not below the statement timeout", () => {
+    const message = configError({
+      ...MINIMAL,
+      DATABASE_LOCK_TIMEOUT_MS: "5000",
+      DATABASE_STATEMENT_TIMEOUT_MS: "5000",
+    }).message;
+
+    expect(message).toContain("DATABASE_LOCK_TIMEOUT_MS");
+  });
+
+  test("rejects a retry cap below its base", () => {
+    const message = configError({
+      ...MINIMAL,
+      OUTBOX_RETRY_BASE_MS: "5000",
+      OUTBOX_RETRY_CAP_MS: "1000",
+    }).message;
+
+    expect(message).toContain("OUTBOX_RETRY_CAP_MS");
   });
 
   test("refuses MIKRO_ORM_* variables, naming them without their values", () => {

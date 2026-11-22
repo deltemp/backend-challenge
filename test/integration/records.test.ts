@@ -34,7 +34,9 @@ describe("persistence records", () => {
 
   beforeAll(async () => {
     database = await createTestDatabase();
-    orm = await MikroORM.init(createMikroOrmOptions(testDatabaseConfig(database.url)));
+    orm = await MikroORM.init(
+      createMikroOrmOptions(testDatabaseConfig(database.url), "application"),
+    );
     sql = new SQL(database.url);
   });
 

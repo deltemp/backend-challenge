@@ -11,7 +11,7 @@ import { createMikroOrmOptions } from "./mikro-orm.config";
       driver: PostgreSqlDriver,
       inject: [APP_CONFIG],
       useFactory: (config: AppConfig) => ({
-        ...createMikroOrmOptions(config.database),
+        ...createMikroOrmOptions(config.database, "application"),
         // Every unit of work forks its own EntityManager explicitly; there is no implicit
         // per-request context to lean on, and the global EntityManager stays unusable.
         registerRequestContext: false,

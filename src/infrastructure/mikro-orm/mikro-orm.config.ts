@@ -7,12 +7,23 @@ import { PERSISTENCE_RECORDS } from "./records";
 export const MIGRATIONS_DIRECTORY = join(import.meta.dirname, "migrations");
 
 /**
+ * Who opens the connections. The application's sessions run with the lock and statement
+ * timeouts; migrations run without them, so a long DDL statement or a lock wait is not cut off.
+ */
+export type SessionPurpose = "application" | "migrations";
+
+/**
  * MikroORM options shared by the application, the migration scripts and the tests.
  *
  * Persistence records (`defineEntity` schemas, never domain classes) are registered in
  * `entities`. MikroORM 7 connects lazily: nothing touches the database until the first query.
  */
-export function createMikroOrmOptions(database: DatabaseConfig) {
+export function createMikroOrmOptions(database: DatabaseConfig, purpose: SessionPurpose) {
+  // Session settings, sent by the pg driver when it opens each connection.
+  const timeouts =
+    purpose === "application"
+      ? { lock_timeout: database.lockTimeoutMs, statement_timeout: database.statementTimeoutMs }
+      : {};
   return defineConfig({
     clientUrl: database.url,
     entities: PERSISTENCE_RECORDS,
@@ -38,6 +49,7 @@ export function createMikroOrmOptions(database: DatabaseConfig) {
     driverOptions: {
       connectionTimeoutMillis: database.connectTimeoutMs,
       idle_in_transaction_session_timeout: database.idleInTransactionTimeoutMs,
+      ...timeouts,
       keepAlive: true,
     },
     // Application processes never run DDL: databases are created by compose or the test

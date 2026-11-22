@@ -32,14 +32,30 @@ const REDACTED_PATHS = [...FINANCIAL_KEYS, ...SECRET_KEYS].flatMap((key) => [
 const SAFE_ERROR_FIELDS = ["code", "constraint", "table", "column"] as const;
 const MAX_CAUSE_DEPTH = 3;
 
+/**
+ * MikroORM's PostgreSQL error converter appends the error's `detail` and `hint` to its message
+ * ("\n - detail: Failing row contains (...)"), and the stack repeats the message. Both are
+ * removed again here, so the row values they carry never reach the logs.
+ */
+function withoutDriverDetails(text: string | undefined, error: Error): string | undefined {
+  let result = text;
+  for (const field of ["detail", "hint"] as const) {
+    const value: unknown = Reflect.get(error, field);
+    if (result !== undefined && typeof value === "string" && value.trim() !== "") {
+      result = result.replaceAll(`\n - ${field}: ${value}`, "");
+    }
+  }
+  return result;
+}
+
 export function serializeError(error: unknown, depth = 0): Record<string, unknown> {
   if (!(error instanceof Error)) {
     return { type: typeof error, message: String(error) };
   }
   const serialized: Record<string, unknown> = {
     type: error.constructor.name,
-    message: error.message,
-    stack: error.stack,
+    message: withoutDriverDetails(error.message, error),
+    stack: withoutDriverDetails(error.stack, error),
   };
   for (const field of SAFE_ERROR_FIELDS) {
     const value: unknown = Reflect.get(error, field);

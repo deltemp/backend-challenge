@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { PostgreSqlPlatform } from "@mikro-orm/postgresql";
 import { serializeError } from "../../src/infrastructure/observability/logger";
 
 /** The shape of a PostgreSQL check-constraint violation, as the pg driver reports it. */
@@ -45,6 +46,21 @@ describe("serializeError", () => {
 
     expect(serialized.cause).toMatchObject({ constraint: "wallets_balance_check" });
     expect(JSON.stringify(serialized)).not.toContain("Failing row");
+  });
+
+  test("removes the detail that MikroORM appends to the message and the stack", () => {
+    // MikroORM's PostgreSQL converter appends `detail` to the message the logs keep.
+    const converted = new PostgreSqlPlatform()
+      .getExceptionConverter()
+      .convertException(checkViolation());
+    expect(converted.message).toContain("Failing row");
+
+    const serialized = serializeError(converted);
+
+    expect(serialized).toMatchObject({ code: "23514", constraint: "wallets_balance_check" });
+    expect(String(serialized.message)).toContain("wallets_balance_check");
+    expect(JSON.stringify(serialized)).not.toContain("Failing row");
+    expect(JSON.stringify(serialized)).not.toContain("-80.00");
   });
 
   test("describes values thrown that are not errors", () => {

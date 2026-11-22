@@ -96,6 +96,13 @@ export interface WagerTransactionPendingReferenceData extends WagerTransactionEv
   readonly referenceDeadline: string;
 }
 
+export interface WagerTransactionFailedData extends WagerTransactionEventData {
+  /** Always INTERNAL_ERROR. */
+  readonly failureCode: FailureCode;
+  /** The balance observed when the transaction was parked. */
+  readonly balance: MoneyProps | null;
+}
+
 function transactionData(transaction: WagerTransaction): WagerTransactionEventData {
   return {
     transactionId: transaction.id,
@@ -205,6 +212,38 @@ export class WagerTransactionPendingReference extends IntegrationEvent<WagerTran
         ...transactionData(transaction),
         referenceExternalTransactionId,
         referenceDeadline: referenceDeadline.toISOString(),
+      },
+    });
+  }
+}
+
+/**
+ * Raised when a parked transaction ends FAILED: its reprocessing hit an unrecoverable,
+ * non-business error. Every terminal outcome has its event, so consumers learn it is over.
+ */
+export class WagerTransactionFailed extends IntegrationEvent<WagerTransactionFailedData> {
+  readonly eventType = "WagerTransactionFailed";
+  readonly version = 1;
+  readonly orderingKey: string;
+
+  private constructor(props: IntegrationEventProps<WagerTransactionFailedData>) {
+    super(props);
+    this.orderingKey = props.data.walletId;
+  }
+
+  static from(transaction: WagerTransaction, context: EventContext): WagerTransactionFailed {
+    requireStatus(transaction, WagerTransactionStatus.Failed);
+    const { failureCode } = transaction;
+    if (failureCode === undefined) {
+      throw new InvariantViolationError("a failed transaction has a failure code");
+    }
+    return new WagerTransactionFailed({
+      ...context,
+      aggregateId: transaction.id,
+      data: {
+        ...transactionData(transaction),
+        failureCode,
+        balance: transaction.observedBalance?.toJSON() ?? null,
       },
     });
   }

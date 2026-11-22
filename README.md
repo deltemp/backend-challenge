@@ -4,7 +4,7 @@ Solution to Jungle Gaming's backend technical challenge: a distributed financial
 
 The original challenge statement (in Portuguese) is kept verbatim in [docs/CHALLENGE.md](docs/CHALLENGE.md).
 
-> **Status:** the foundation is in place: configuration, structured logs, metrics, health checks, database migrations, SQS queue provisioning, three replicas behind a proxy, and the test harness. The domain model (wallets, transactions and their rules, the double-entry ledger, inbox and outbox) and the database schema are implemented and tested. The use cases, the wagering API, the SQS consumer and the background workers are not implemented yet.
+> **Status:** the foundation is in place: configuration, structured logs, metrics, health checks, database migrations, SQS queue provisioning, three replicas behind a proxy, and the test harness. The domain model (wallets, transactions and their rules, the double-entry ledger, inbox and outbox), the database schema and the use cases with their repositories (wallets, transactions, queries, reconciliation, reference retries and outbox publishing) are implemented and tested. The wagering HTTP API, the SQS consumer loop and the background worker loops that run them are not implemented yet.
 
 ## Stack
 
@@ -117,6 +117,11 @@ Environment variables, validated at boot. An invalid or missing value stops the 
 | `DATABASE_POOL_MAX` | `10` | Connection pool size per process |
 | `DATABASE_CONNECT_TIMEOUT_MS` | `5000` | Longest wait for a database connection |
 | `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS` | `30000` | PostgreSQL ends a session idle inside a transaction for longer, releasing its locks |
+| `DATABASE_LOCK_TIMEOUT_MS` | `2000` | Longest wait for a contended wallet; then a transient `WALLET_BUSY` (application sessions only, not migrations) |
+| `DATABASE_STATEMENT_TIMEOUT_MS` | `5000` | Longest statement; then a transient `DEPENDENCY_UNAVAILABLE` (application sessions only) |
+| `REFERENCE_TTL_MS` | `900000` | How long a transaction waits for its reference after receipt (15 minutes) |
+| `REFERENCE_RETRY_BASE_MS` / `REFERENCE_RETRY_CAP_MS` | `1000` / `60000` | Full-jitter backoff between attempts to resolve a missing reference |
+| `OUTBOX_RETRY_BASE_MS` / `OUTBOX_RETRY_CAP_MS` | `1000` / `60000` | Full-jitter backoff after a failed event publication |
 | `PORT` | `3000` | HTTP port; `0` picks a free port |
 | `APP_ROLES` | `api,consumer,outbox,retry` | What this process runs |
 | `LOG_LEVEL` | `info` | pino log level |

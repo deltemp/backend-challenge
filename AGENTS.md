@@ -8,7 +8,7 @@ Solution to Jungle Gaming's backend challenge, "Distributed Wagering Processor":
 
 - **Requirements:** `docs/CHALLENGE.md`, the original statement in Portuguese. Never edit or translate it. `§N` below refers to its sections.
 - **Decisions and rationale:** `ARCHITECTURE.md`, a required deliverable. It holds the reasoning behind the rules in this file; keep both in sync.
-- **Status: domain and schema implemented.** Configuration, logging, metrics, health checks, migration tooling, queue provisioning, the Compose stack and the test harness exist, and so do the domain model (`src/domain`), the persistence records and the first migration. The application layer (`src/application`: use cases and ports), the repositories and every business feature (API, consumer, workers) do not exist yet. Keep "Commands" and "Layout" in line with reality, in the same change that alters them.
+- **Status: domain, schema and use cases implemented.** Configuration, logging, metrics, health checks, migration tooling, queue provisioning, the Compose stack and the test harness exist, and so do the domain model (`src/domain`), the persistence records and the first migration, and the application layer (`src/application`: ports and use cases) with its MikroORM repositories, unit of work and SQS event publisher. The interfaces that run the use cases (the wagering HTTP API, the SQS consumer loop, the outbox and retry worker loops) and the business metrics do not exist yet. Keep "Commands" and "Layout" in line with reality, in the same change that alters them.
 
 ### What is graded (§14)
 
@@ -95,16 +95,23 @@ src/
     events/          IntegrationEvent and the four events
     messaging/       InboxMessage, OutboxMessage
     shared/          domain errors, FullJitterBackoff
-  application/       (next) use cases and ports (repositories, unit of work, clock,
-                     random source, id generator)
+  application/
+    ports/           clock, id generator, repositories, unit of work, event publisher
+    use-cases/       OpenWallet, SubmitWagerTransaction, FindDuePendingReferences,
+                     ReprocessPendingReference, PublishOutbox, queries (GetWallet,
+                     GetWalletLedger, GetWagerTransaction, ReconcileWallet)
+                     errors.ts (protocol codes), views.ts (outputs), policies.ts (retry
+                     settings), wager-processing.ts, integration-events.ts, ledger-cursor.ts
   infrastructure/
     config/          environment schema (Zod), loadConfig, ConfigModule (APP_CONFIG token)
     observability/   pino logger, request context (AsyncLocalStorage), metrics, HTTP middleware
     mikro-orm/       ORM options, DatabaseModule, Postgres readiness check;
                      records/ (defineEntity, scalar-only), migrations/ (hand-written SQL and
-                     the diff snapshot); (next) repositories
-    sqs/             SQS client, queue provisioning, SQS readiness check;
-                     (next) consumer and publisher adapters
+                     the diff snapshot), repositories/, unit-of-work.ts, database-errors.ts
+    sqs/             SQS client, queue provisioning, SQS readiness check, event publisher;
+                     (next) consumer
+    runtime.ts       system clock, UUIDv7 ids, Math.random behind the ports
+    use-cases.ts     composition root: createUseCases(dependencies)
   interfaces/
     http/            health and metrics controllers, AuthGuard; (next) API controllers
     (next)           sqs-consumer/, workers/ (outbox publisher, reference retry)
@@ -112,7 +119,8 @@ src/
   main.ts            one entry point; APP_ROLES selects what runs
 scripts/             migrations.ts, provision.ts
 test/
-  support/           preload, per-file databases and queues, app processes, ledger invariant
+  support/           preload, per-file databases and queues, app processes, ledger invariant,
+                     use-case harness (TestClock, command builders)
   unit/              unit/domain/ covers the §13 unit list
   integration/       schema.test.ts proves every schema guarantee; records.test.ts the mappings
   concurrency/  load/
@@ -142,6 +150,9 @@ Each of these cost time once. Do not rediscover them.
 - **Bun SQL binds a JavaScript string for a `jsonb` column as a JSON string,** not as an object; pass the object itself.
 - **MikroORM infers optional `em.create` fields from defaults, not from generated columns:** the outbox `sequenceNumber` is typed `Opt<string>` so the application never has to (and never can usefully) pass it.
 - **The migrator is silent** (`silent: true`): its own progress lines are plain text, not JSON logs; the scripts print what they applied.
+- **MikroORM's PostgreSQL converter appends `detail` and `hint` to the error message** ("\n - detail: Failing row contains (...)"), and the stack repeats the message. `serializeError` removes exactly those suffixes again; keep it that way, or row values (amounts included) reach the logs through `message` and `stack`.
+- **MikroORM types only some SQLSTATEs** (unique, foreign key, check, not null, deadlock). A lock timeout (55P03) or a statement timeout (57014) arrives as a plain `DriverException`; `translateDatabaseError` reads the code itself.
+- **MikroORM's identity map would answer a re-read from memory.** Reads in repositories pass `disableIdentityMap: true`; never rely on a managed entity loaded earlier in the same unit of work.
 
 ## Domain modeling (§6)
 
@@ -171,7 +182,10 @@ The class skeletons in §6 and §11 are the reference. Names may be adapted; gua
 - **Migrations** are MikroORM migrations with hand-reviewed SQL. Every `up()` has a `down()` that works, covered by an up → down → up test. Do not rewrite a committed migration without asking.
 - **Application processes never run DDL.** `ensureDatabase` is off: databases come from compose or the test harness, the schema only from migrations.
 - **Connection limits** live in `createMikroOrmOptions` and come from the environment: a 5-second connection timeout, so an unreachable database fails fast as a transient error, and a 30-second `idle_in_transaction_session_timeout`, so PostgreSQL releases the row locks of a process that stalled or vanished mid-transaction.
-- **Lock and statement timeouts** (decided; wired into `createMikroOrmOptions` together with the first use case): a 2-second `lock_timeout` and a 5-second `statement_timeout`, configurable through the environment, applied to the application's sessions only. Migrations run without them. A lock timeout answers `WALLET_BUSY`; a statement timeout or an unreachable dependency answers `DEPENDENCY_UNAVAILABLE`, both 503.
+- **Lock and statement timeouts:** a 2-second `lock_timeout` and a 5-second `statement_timeout` (`DATABASE_LOCK_TIMEOUT_MS`, `DATABASE_STATEMENT_TIMEOUT_MS`), sent by the pg driver as session settings when `createMikroOrmOptions(database, "application")` opens a connection. `"migrations"` sessions run without them. The lock timeout must stay below the statement timeout (`loadConfig` refuses otherwise), or a long lock wait would end as a statement timeout. A lock timeout answers `WALLET_BUSY`; a statement timeout or an unreachable dependency answers `DEPENDENCY_UNAVAILABLE`, both 503.
+- **The unit of work** (`MikroOrmUnitOfWork`) forks an EntityManager per call and runs the work in `em.transactional`. `translateDatabaseError` maps failures by SQLSTATE: 23505 becomes a `DuplicateKeyError` named by meaning (`idempotency-key`, `external-transaction`, `inbox-message`, `reversal`, `wallet-owner`), 55P03/40P01/40001 a `WalletBusyError`, statement timeouts, server shutdowns, classes 08 (connection), 53 (insufficient resources) and 58 (system and I/O) and lost connections a `DependencyUnavailableError`; anything else (schema guards, bugs) passes through. Renaming one of those unique constraints in a migration means updating its mapping: the race tests in `test/integration/submit-wager-transaction.test.ts` (idempotency key, provider id, inbox) and the concurrent openings in `open-wallet.test.ts` (wallet owner) catch a mismatch.
+- **Validation comes before any lock.** `RequestCheck` (`src/application/request-limits.ts`) refuses identifiers longer than the schema allows and a wallet id that is not a UUID (`InvalidRequestError`, `VALIDATION_FAILED`), and the transaction is built (and validated by the domain) before the unit of work starts. A query by an id that is not a UUID answers not found without querying. A second lost race on the same request becomes `WALLET_BUSY`: contention, nothing committed.
+- **Repositories** read with `disableIdentityMap: true` (a read after taking a lock must see the latest committed row, never a cached one) and write with native statements (`em.insert`, `em.nativeUpdate`), run at once and in call order. Raw SQL goes through `em.execute(sql, params)` with `?` placeholders, which MikroORM escapes; never build SQL by concatenation. Records map to domain objects only through the mappers in `repositories/mappers.ts`.
 
 ## Decisions already made
 
@@ -236,21 +250,24 @@ Protocol errors use RFC 9457 `application/problem+json`: `type` is `about:blank`
 | 503 | `DEPENDENCY_UNAVAILABLE` | PostgreSQL or SQS unreachable, or a statement timeout |
 | 500 | `UNEXPECTED_ERROR` | A bug |
 
-`GET /wallets/:walletId/ledger` paginates by `wallet_version`. The cursor is that number encoded in base64url, and it is opaque to clients.
+`GET /wallets/:walletId/ledger` paginates by `wallet_version`, newest entry first, like a statement: the cursor is the version of the last entry returned, encoded in base64url and opaque to clients, and leads to the older entries. Pages hold 50 entries by default and at most 100. A cursor this service did not issue is `INVALID_CURSOR`.
 
 `POST /wallets/:walletId/reconciliation` reads the stored balance and the wallet's ledger in one consistent snapshot, so concurrent transactions cannot produce false divergences. A divergence is logged, counted in a metric and flagged in the response, never corrected.
 
 ### Messaging (§10, §11)
 
 - Inbound queues: `wager-transactions.fifo` and `wager-transactions-dlq.fifo`. The consumer calls the same use case as the HTTP entry point.
-- Deduplicate with the persistent inbox on `(consumerName, messageId)`. Acknowledge only after the commit.
+- Deduplicate with the persistent inbox on `(consumerName, messageId)`. Acknowledge only after the commit. A message found in the inbox answers from the transaction it produced and does nothing again; the same message id with another payload is an `InboxConflictError` (queue-only, permanent: straight to the DLQ), never processed and never a replay.
 - Error classes: a business rejection is terminal, so acknowledge it; a transient error extends the visibility timeout with full-jitter exponential backoff (base 5 s, cap 60 s, so at most about 2 min 15 s across the 5 receives); a permanent error (malformed message, unknown type, unknown wallet) goes straight to the DLQ. The redrive policy uses `maxReceiveCount = 5`.
 - While PostgreSQL or SQS is unreachable, the consumer stops receiving and probes the dependency with backoff before resuming. An outage therefore does not use up the 5 receives and does not push healthy messages to the DLQ; per-message backoff is left for isolated failures such as a lock timeout.
 - Producers are expected to use `walletId` as `MessageGroupId`. Correctness must not depend on it.
 - On `SIGTERM`, stop polling, then finish in-flight messages or return their visibility. The queue's default long poll (20 s) is longer than the shutdown budget (`SHUTDOWN_TIMEOUT_MS`, 10 s): pass an `AbortSignal` to every `ReceiveMessage` and abort it as the first shutdown step, and set `WaitTimeSeconds` on each call. Keep the shutdown budget above the longest message processing plus the visibility calls, and below compose's `stop_grace_period` (15 s).
 - Outbox: workers poll with `FOR UPDATE SKIP LOCKED`, publish at-least-once to `wager-events.fifo` (`MessageGroupId = walletId`, `MessageDeduplicationId = eventId`), then mark the rows as published. A crash between commit and publish must be recovered by another instance. A failed publish reschedules the row; it is never dropped. A published row is final in the schema: hold the row lock from claim to marking, and mark with `… WHERE published_at IS NULL`, so a repeated publication is a no-op rather than a trigger error.
 - Events are published in commit order per wallet: only the oldest unpublished event of each wallet is eligible, ordered by a database sequence assigned at insert, under the wallet lock (never by UUIDv7, which follows each instance's clock). Concurrent publishers therefore never hold two events of the same wallet. An event that keeps failing holds back the later events of its wallet only, and the 10-attempt gauge raises the alert.
-- Minimum events: `WagerTransactionProcessed` (every applied transaction, including `LOSS`), `WagerTransactionRejected`, `WalletBalanceChanged` (only when the balance changes), `WagerTransactionPendingReference`.
+- Events: `WagerTransactionProcessed` (every applied transaction, including `LOSS` and the `OPENING`), `WagerTransactionRejected`, `WalletBalanceChanged` (only when the balance changes, after the transaction's own event), `WagerTransactionPendingReference` (when first parked; a rescheduled attempt raises nothing), and `WagerTransactionFailed` (a parked transaction that ends `FAILED`), so every terminal outcome has its event. Opening a wallet above zero raises `WagerTransactionProcessed` (kind `OPENING`) and `WalletBalanceChanged`; opening at zero raises nothing, and there is no wallet-creation event.
+- Published message: the body is the event envelope (JSON), `MessageGroupId` the wallet, `MessageDeduplicationId` the event id, and a `eventType` message attribute.
+- Reference retries: `ReprocessPendingReference` locks the wallet with `SKIP LOCKED` (busy means skip and come back), reads the transaction again under the lock, and skips it unless it is still `PENDING_REFERENCE` and due. An unexpected, non-transient error marks it `FAILED` (`INTERNAL_ERROR`) in a new unit of work, with its event; a transient error (`WALLET_BUSY`, `DEPENDENCY_UNAVAILABLE`) or a lost race on the reversal index leaves it parked. Any other duplicate key is a bug and ends `FAILED`.
+- Obligations of the worker loops (next step): the retry loop processes due ids sequentially, oldest first, within each process (a chain must resolve in order), and paces itself when a round fails transiently or skips busy wallets, since those leave `next_attempt_at` unchanged. The outbox publisher gets an SQS client of its own with a short request timeout and `maxAttempts: 1` (the outbox has its own backoff, and its transaction stays open during the call), and shutdown aborts its calls.
 
 ### Retry policies
 
@@ -265,7 +282,7 @@ Pacing and termination are separate concerns. Pacing spreads retries, so that a 
 
 - The `PENDING_REFERENCE` deadline is `receipt + TTL`, fixed when the transaction is first persisted. The next attempt is never scheduled past the deadline, and rejection only happens on a real lookup made at or after it. A transaction is therefore never abandoned before the TTL and never rejected without being looked up, even after the worker was down. The TTL errs long on purpose: a reversal that expires before its `BET` arrives leaves the player debited for a bet the provider cancelled, while waiting longer only costs a few cheap lookups. There is no attempt limit: with full jitter, an attempt count says nothing about elapsed time.
 - A confirmed event can never be lost, so the outbox has no TTL and no attempt limit. A gauge counts pending outbox rows with 10 or more attempts; together with outbox lag, that is the alert signal. The table itself is the intervention list.
-- Base, cap, TTL and the attempt threshold are configurable through the environment, so tests can use short values.
+- Base, cap, TTL and the attempt threshold are configurable through the environment (`REFERENCE_TTL_MS`, `REFERENCE_RETRY_BASE_MS`, `REFERENCE_RETRY_CAP_MS`, `OUTBOX_RETRY_BASE_MS`, `OUTBOX_RETRY_CAP_MS`; the attempt threshold arrives with its gauge), so tests can use short values.
 - Time and randomness are injected through the `Clock` and `RandomSource` ports. Domain and application code never calls `Date.now()`, `new Date()` or `Math.random()` directly, which keeps backoff and expiry tests deterministic.
 
 ### Runtime topology
@@ -282,14 +299,15 @@ Pacing and termination are separate concerns. Pacing spreads retries, so that a 
 - Structured JSON logs carry `correlationId`, `messageId`, `transactionId`, `walletId` and `providerId`, propagated with `AsyncLocalStorage`. Never log secrets or full financial payloads.
 - Log errors under `err`. They go through an allowlist serializer (type, message, stack, code, constraint, table, column, cause), because database errors carry row values in `detail`, `where` and the failed query. Never widen it to those fields.
 - The request-context middleware is registered with `app.use()` in `main.ts`, before NestJS adds its body parser, so requests the parser rejects are still logged and measured. Do not move it into a module's `configure()`.
-- Metrics cover at least: transactions by status, duplicates detected, retries, messages in the DLQ, lock conflicts, outbox lag and processing latency. No money amounts and no unbounded identifiers as label values.
+- Metrics cover at least: transactions by status, duplicates detected, retries, messages in the DLQ, lock conflicts, outbox lag and processing latency. No money amounts and no unbounded identifiers as label values. Use cases stay free of metrics and logging: their results say what happened (`idempotentReplay`, `duplicateMessage`, the reprocess status, the publication failures, `consistent` in a reconciliation report), and the interfaces that call them record metrics and logs from those results. A reconciliation divergence is logged and counted there.
 - Metrics are per process. Read them from each replica (for example a Prometheus on the compose network that discovers `app` through Docker DNS), never through the proxy, which hands each scrape to a different replica. Gauges of shared state (outbox lag, rows with many attempts, DLQ depth, pending references) are computed from PostgreSQL or SQS, so every replica reports the same value.
 - `GET /health/live` reports on the process; `GET /health/ready` checks PostgreSQL and SQS.
 
 ## Testing (§13)
 
 - §13 lists the mandatory unit, integration and concurrency cases. Treat that list as a checklist and keep test names traceable to it.
-- Concurrency tests use real parallelism: multi-instance cases run real OS processes. Sequential mocks, or several async tasks posing as instances, do not count.
+- Concurrency tests use real parallelism: multi-instance cases run real OS processes. Sequential mocks, or several async tasks posing as instances, do not count. `test/concurrency/use-cases.test.ts` runs the use cases concurrently inside one process, each call on its own connection, so the database-level locking is genuinely exercised; it does not replace the multi-process versions of the §13 scenarios (several instances, two publishers in two processes, a worker killed between commit and acknowledgement, a restart), which come with the interfaces.
+- **Use-case tests** open `openUseCaseHarness()` (`test/support/use-cases.ts`): a database of their own, an application ORM with the session timeouts, and the real adapters. `TestClock` and a fixed `random` make deadlines and backoff exact; `variant({ publisher, wrapUnitOfWork })` swaps the publisher or wraps the unit of work for fault injection. Tests that never publish get a publisher that fails if reached; publication tests use `SqsEventPublisher` on LocalStack.
 - **Harness (`test/support`).** Each integration or concurrency file creates, in `beforeAll`, its own database (`createTestDatabase()`, cloned from the template the preload migrates once per run) and its own queue set (`createTestQueues()`), and releases them in `afterAll` with `cleanUp(...)`, which runs every step even when one fails. Instances are real processes built from the current sources: `startApp(appEnvironment(database, queues))`, then `waitUntilReady()`, and `stop("SIGKILL")` for crash scenarios. No image rebuild is needed.
 - `startApp` refuses an environment without the test file's database and queues, withholds the LocalStack token and `MIKRO_ORM_*` from the child, runs every role unless `APP_ROLES` is passed, and kills a process that fails to start. When starting several instances, keep each one that started (`Promise.allSettled`) so `afterAll` can stop it. The preload sweeps test databases and queues older than an hour.
 - Windows cannot deliver a catchable SIGTERM, so `stop("SIGTERM")` kills at once there. Test graceful shutdown against a container (`docker stop`), where it runs on Linux. An exit code of 143 after SIGTERM is expected: NestJS re-raises the signal once its cleanup is done.
@@ -325,4 +343,6 @@ Pacing and termination are separate concerns. Pacing spreads retries, so that a 
 
 ## Open points
 
-None right now. When a decision comes up that this file and `docs/CHALLENGE.md` do not cover, list it here and raise it with the maintainer before implementing the related part.
+When a decision comes up that this file and `docs/CHALLENGE.md` do not cover, list it here and raise it with the maintainer before implementing the related part.
+
+- **HTTP status of a `FAILED` transaction** (to settle before the HTTP API). The status table covers `PROCESSED` (200), `PENDING_REFERENCE` (202) and `REJECTED` (422), but not `FAILED`, which a replay of its idempotency key or a lookup can return.

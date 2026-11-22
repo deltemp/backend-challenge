@@ -7,7 +7,7 @@ export async function withMigrationOrm<T>(
   database: DatabaseConfig,
   work: (orm: MikroORM) => Promise<T>,
 ): Promise<T> {
-  const orm = await MikroORM.init(createMikroOrmOptions(database));
+  const orm = await MikroORM.init(createMikroOrmOptions(database, "migrations"));
   try {
     return await work(orm);
   } finally {

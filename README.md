@@ -4,7 +4,7 @@ Solution to Jungle Gaming's backend technical challenge: a distributed financial
 
 The original challenge statement (in Portuguese) is kept verbatim in [docs/CHALLENGE.md](docs/CHALLENGE.md).
 
-> **Status:** every mandatory requirement is implemented and tested: the wagering HTTP API, the SQS consumer, the outbox publisher and the reference retry worker, on top of the domain model (wallets, transactions and their rules, the double-entry ledger, inbox and outbox), the database schema and the use cases. Three replicas run every role behind a proxy. OpenTelemetry tracing and the full load test come next.
+> **Status:** every mandatory requirement is implemented and tested: the wagering HTTP API, the SQS consumer, the outbox publisher and the reference retry worker, on top of the domain model (wallets, transactions and their rules, the double-entry ledger, inbox and outbox), the database schema and the use cases. Three replicas run every role behind a proxy. OpenTelemetry tracing follows each transaction from HTTP or the queue through the use case and its SQL transaction to the events it publishes, with a Grafana dashboard in an optional Compose profile. The full load test comes next.
 
 ## Stack
 
@@ -18,6 +18,7 @@ The original challenge statement (in Portuguese) is kept verbatim in [docs/CHALL
 | Messaging | AWS SQS on LocalStack (AWS SDK for JavaScript v3) |
 | Validation | Zod |
 | Logs and metrics | pino (JSON) and prom-client |
+| Tracing | OpenTelemetry (OTLP); Grafana, Tempo and Prometheus from grafana/otel-lgtm, optional |
 | Local orchestration | Docker Compose, nginx in front of 3 replicas |
 | Lint and format | Biome |
 
@@ -49,7 +50,7 @@ curl http://localhost:3000/health/ready
 | `app` | 3 replicas of the application, started after `provision` succeeds; healthy only when ready, restarted unless stopped | none |
 | `proxy` | nginx, load-balancing across the replicas | 3000 |
 
-PostgreSQL is published on 55432 rather than 5432 so that a PostgreSQL installed on your machine does not answer in its place. Every host port can be changed in `.env` (`APP_PORT`, `POSTGRES_PORT`, `LOCALSTACK_PORT`); keep `DATABASE_URL` and `AWS_ENDPOINT_URL` in line with them.
+PostgreSQL is published on 55432 rather than 5432 so that a PostgreSQL installed on your machine does not answer in its place. Every host port can be changed in `.env` (`APP_PORT`, `POSTGRES_PORT`, `LOCALSTACK_PORT`); keep `DATABASE_URL` and `AWS_ENDPOINT_URL` in line with them. The `observability` profile adds Grafana on port 3001 ([Observability](#observability)).
 
 To run a single instance on the host instead, with reload on change:
 
@@ -126,6 +127,23 @@ The same transaction can be sent to `wager-transactions.fifo` as a `WagerTransac
 
 Requests may carry an `x-correlation-id` header; it is echoed back and attached to every log line, and one is generated when absent. A queue message may carry a `correlationId` message attribute for the same purpose.
 
+## Observability
+
+Logs are JSON on stdout (`docker compose logs app`), and every instance serves its Prometheus metrics on `/metrics`. Start the stack with the `observability` profile to add Grafana, Tempo, Prometheus and an OpenTelemetry Collector, all from the [grafana/otel-lgtm](https://github.com/grafana/docker-otel-lgtm) image (about 4 GB):
+
+```sh
+docker compose --profile observability up -d --build --wait
+```
+
+Open http://localhost:3001 (`GRAFANA_PORT`). No login is needed: anonymous access is the image's default, fit for local use only. The home dashboard, **Wagering processor**, shows the business metrics of the three replicas, which Prometheus scrapes one by one, and tables of recent submissions and failed traces. Click a trace id to follow a request through the use case and its SQL transaction. **Explore → Tempo** searches traces with TraceQL, for example `{span.wagering.failure_code="INSUFFICIENT_FUNDS"}` or `{name="SubmitWagerTransaction" && span.wagering.transaction.status="REJECTED"}`. Spans reach Tempo some seconds after the request.
+
+- A W3C `traceparent` header on a request, or a `traceparent` message attribute on `wager-transactions.fifo`, makes the transaction part of the caller's trace. The events it produces carry the trace on, as `traceparent` attributes on `wager-events.fifo`.
+- Log lines written inside a traced operation carry its `traceId` and `spanId`.
+- Spans carry ids, kinds, statuses and failure codes, never amounts.
+- The replicas always export their spans to the collector. Without the profile the exports fail in the background and the spans are dropped; requests do not wait for them.
+- To trace an instance started on the host, set `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318` in `.env` and start `otel-lgtm` with `docker compose --profile observability up -d --wait otel-lgtm`.
+- Grafana keeps nothing across `docker compose down`.
+
 ## Configuration
 
 Environment variables, validated at boot. An invalid or missing value stops the process with a message that names the variable but never prints its value. `MIKRO_ORM_*` variables are refused, because MikroORM would apply them around this validation.
@@ -164,6 +182,10 @@ Environment variables, validated at boot. An invalid or missing value stops the 
 | `REFERENCE_RETRY_BATCH_SIZE` | `50` | Parked transactions taken per retry round |
 | `REFERENCE_RETRY_POLL_INTERVAL_MS` | `1000` | Wait after a retry round with nothing due |
 | `OUTAGE_BACKOFF_BASE_MS` / `OUTAGE_BACKOFF_CAP_MS` | `1000` / `30000` | Full-jitter pacing of the consumer and the workers while PostgreSQL or SQS is unavailable |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (tracing off) | Base URL of an OTLP/HTTP collector; spans go to `<url>/v1/traces`. Compose sets `http://otel-lgtm:4318` |
+| `OTEL_SERVICE_NAME` | `wagering-processor` | `service.name` of the spans |
+| `TRACING_SAMPLE_RATIO` | `1` | Share of new traces recorded, from 0 to 1; a caller's sampling decision is always followed |
+| `TRACING_EXPORT_DELAY_MS` | `5000` | Longest wait before finished spans are exported, in batches |
 | `TEST_CONSUMER_ACK_DELAY_MS` | `0` | Test seam, accepted only with `NODE_ENV=test`: a pause between a message's commit and its acknowledgement |
 
 Bun loads `.env` automatically for processes started on the host. Containers get their values from `compose.yaml`.
@@ -174,6 +196,7 @@ Bun loads `.env` automatically for processes started on the host. Containers get
 - **Tests report that PostgreSQL is unreachable, or authentication fails:** make sure `DATABASE_URL` in `.env` points at port 55432 (or your `POSTGRES_PORT`), not at a local PostgreSQL.
 - **A port is already in use:** change it in `.env` as described in Setup.
 - **`/health/ready` reports SQS down after LocalStack restarted:** LocalStack keeps no state, so the queues are gone. `docker compose up -d --wait` runs `provision` again and recreates them.
+- **Grafana shows no traces:** check that `otel-lgtm` is healthy and that the replicas logged `"tracing":true` on the `http server listening` line. A failed export is silent by design.
 
 ## Documentation
 

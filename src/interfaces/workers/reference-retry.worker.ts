@@ -118,10 +118,9 @@ export class ReferenceRetryWorker
     const startedAt = performance.now();
     let result: ReprocessResult;
     try {
-      result = await this.useCases.reprocessPendingReference.execute({
-        transactionId,
-        correlationId,
-      });
+      result = await this.telemetry.traceReprocess(transactionId, () =>
+        this.useCases.reprocessPendingReference.execute({ transactionId, correlationId }),
+      );
     } catch (error) {
       if (error instanceof WalletBusyError) {
         // Like a SKIP LOCKED skip: the wallet is contended, the next transaction may not be.

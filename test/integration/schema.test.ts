@@ -967,6 +967,37 @@ describe("outbox", () => {
     );
   });
 
+  test("the trace context belongs to the event: a JSON object or nothing, never changed", async () => {
+    const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    // Bun SQL binds a string for a jsonb column as a JSON string: not an object.
+    await expectViolation(
+      db().begin(
+        (tx) => tx`insert into outbox_messages ${tx(outboxRow({ trace_context: traceparent }))}`,
+      ),
+      "23514",
+      "outbox_messages_trace_context_check",
+    );
+
+    const traced = outboxRow({ trace_context: { traceparent } });
+    const id = String(traced.id);
+    await db()`insert into outbox_messages ${db()(traced)}`;
+    const rows: { trace_context: unknown }[] = await db()`
+      select trace_context from outbox_messages where id = ${id}`;
+    expect(rows).toEqual([{ trace_context: { traceparent } }]);
+
+    for (const change of [
+      () =>
+        db().begin((tx) => tx`update outbox_messages set trace_context = null where id = ${id}`),
+      () =>
+        db().begin(
+          (tx) =>
+            tx`update outbox_messages set trace_context = '{"traceparent":"other"}' where id = ${id}`,
+        ),
+    ]) {
+      await expectViolation(change(), "23000", "outbox_messages_event_immutable");
+    }
+  });
+
   test("a published event is final, and only then may it be purged", async () => {
     const pending = outboxRow();
     const id = String(pending.id);

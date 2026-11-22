@@ -13,6 +13,12 @@ export interface OutboxMessageState {
   readonly attempts: number;
   readonly nextAttemptAt: Date | undefined;
   readonly publishedAt: Date | undefined;
+  /**
+   * The W3C trace context headers of the transaction that wrote the event, when it was traced.
+   * The outbox repository records them, and the publisher sends them with the event, so its
+   * consumers continue that trace. Opaque to the domain.
+   */
+  readonly traceContext?: Readonly<Record<string, string>> | undefined;
 }
 
 /**
@@ -31,6 +37,7 @@ export class OutboxMessage {
     private _attempts: number,
     private _nextAttemptAt: Date | undefined,
     private _publishedAt: Date | undefined,
+    readonly traceContext: Readonly<Record<string, string>> | undefined,
   ) {}
 
   /** Stores an event under its own id, due for publication right away. */
@@ -44,6 +51,7 @@ export class OutboxMessage {
       event.occurredAt,
       0,
       event.occurredAt,
+      undefined,
       undefined,
     );
   }
@@ -60,6 +68,7 @@ export class OutboxMessage {
       state.attempts,
       state.nextAttemptAt,
       state.publishedAt,
+      state.traceContext,
     );
   }
 

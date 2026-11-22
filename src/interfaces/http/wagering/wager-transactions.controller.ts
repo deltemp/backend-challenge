@@ -103,11 +103,13 @@ export class WagerTransactionsController {
     const startedAt = performance.now();
     let result: SubmitWagerTransactionResult;
     try {
-      result = await this.useCases.submitWagerTransaction.execute({
-        ...body,
-        idempotencyKey,
-        correlationId: currentCorrelationId(),
-      });
+      result = await this.telemetry.traceSubmission("http", body, () =>
+        this.useCases.submitWagerTransaction.execute({
+          ...body,
+          idempotencyKey,
+          correlationId: currentCorrelationId(),
+        }),
+      );
     } catch (error) {
       this.telemetry.submissionFailed("http", error, elapsedSeconds(startedAt));
       throw error;

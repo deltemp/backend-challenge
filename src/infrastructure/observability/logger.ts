@@ -1,4 +1,5 @@
-import pino, { type Logger } from "pino";
+import { trace } from "@opentelemetry/api";
+import pino, { type DestinationStream, type Logger } from "pino";
 import type { LogLevel } from "../config/config";
 import { requestContext } from "./request-context";
 
@@ -69,14 +70,30 @@ export function serializeError(error: unknown, depth = 0): Record<string, unknow
   return serialized;
 }
 
-/** Log errors under `err` (or `error`) so they go through {@link serializeError}. */
-export function createLogger(level: LogLevel): Logger {
-  return pino({
-    level,
-    timestamp: pino.stdTimeFunctions.isoTime,
-    formatters: { level: (label) => ({ level: label }) },
-    mixin: () => ({ ...requestContext.getStore() }),
-    redact: { paths: REDACTED_PATHS, censor: "[REDACTED]" },
-    serializers: { err: serializeError, error: serializeError },
-  });
+/** The ids of the active trace, so a log line leads to its trace; nothing outside a traced span. */
+function traceIds(): { traceId?: string; spanId?: string } {
+  const span = trace.getActiveSpan();
+  if (span === undefined || !span.isRecording()) {
+    return {};
+  }
+  const { traceId, spanId } = span.spanContext();
+  return { traceId, spanId };
+}
+
+/**
+ * Log errors under `err` (or `error`) so they go through {@link serializeError}. Lines go to
+ * stdout unless a destination is given (tests capture them).
+ */
+export function createLogger(level: LogLevel, destination?: DestinationStream): Logger {
+  return pino(
+    {
+      level,
+      timestamp: pino.stdTimeFunctions.isoTime,
+      formatters: { level: (label) => ({ level: label }) },
+      mixin: () => ({ ...requestContext.getStore(), ...traceIds() }),
+      redact: { paths: REDACTED_PATHS, censor: "[REDACTED]" },
+      serializers: { err: serializeError, error: serializeError },
+    },
+    destination,
+  );
 }

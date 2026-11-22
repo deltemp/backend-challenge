@@ -24,6 +24,8 @@ export const OutboxMessageRecord = defineEntity({
     attempts: p.integer().columnType("integer").default(0),
     nextAttemptAt: p.datetime().columnType("timestamptz").nullable(),
     publishedAt: p.datetime().columnType("timestamptz").nullable(),
+    // W3C trace context headers of the transaction that wrote the event, when it was traced.
+    traceContext: p.json<Record<string, string>>().columnType("jsonb").nullable(),
   },
   uniques: [{ name: "outbox_messages_sequence_number_unique", properties: ["sequenceNumber"] }],
 });

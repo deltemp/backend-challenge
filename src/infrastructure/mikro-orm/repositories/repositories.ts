@@ -19,6 +19,7 @@ import type { OutboxMessage } from "../../../domain/messaging/outbox-message";
 import { InvariantViolationError } from "../../../domain/shared/errors";
 import type { WagerTransaction } from "../../../domain/wagering/wager-transaction";
 import type { Wallet } from "../../../domain/wallet/wallet";
+import { activeTraceContext } from "../../observability/tracing";
 import {
   InboxMessageRecord,
   LedgerAccountRecord,
@@ -319,8 +320,14 @@ class MikroOrmInboxRepository implements InboxRepository {
 class MikroOrmOutboxRepository implements OutboxRepository {
   constructor(private readonly em: EntityManager) {}
 
+  /** Records the trace context active when the event is written, for the publisher to pass on. */
   async add(message: OutboxMessage): Promise<void> {
-    await this.em.insert(OutboxMessageRecord, outboxMessageRow(message));
+    const row = outboxMessageRow(message);
+    const active = activeTraceContext();
+    await this.em.insert(OutboxMessageRecord, {
+      ...row,
+      traceContext: row.traceContext ?? (Object.keys(active).length > 0 ? active : null),
+    });
   }
 
   async claimDue(now: Date, limit: number): Promise<OutboxMessage[]> {

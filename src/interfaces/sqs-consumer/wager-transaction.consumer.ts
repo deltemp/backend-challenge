@@ -15,6 +15,7 @@ import {
   type OnApplicationBootstrap,
   type OnModuleDestroy,
 } from "@nestjs/common";
+import { type Attributes, SpanKind, trace } from "@opentelemetry/api";
 import type { Logger } from "pino";
 import { DependencyUnavailableError, WalletBusyError } from "../../application/errors";
 import { FullJitterBackoff } from "../../domain/shared/backoff";
@@ -28,6 +29,7 @@ import {
   requestContext,
   resolveCorrelationId,
 } from "../../infrastructure/observability/request-context";
+import { contextFrom, inSpan, MESSAGING } from "../../infrastructure/observability/tracing";
 import { mathRandom } from "../../infrastructure/runtime";
 import { QueueUrls } from "../../infrastructure/sqs/queue-urls";
 import { SQS_CLIENT } from "../../infrastructure/sqs/sqs-client";
@@ -225,13 +227,38 @@ export class WagerTransactionConsumer
     return outage ? "outage" : "done";
   }
 
-  private async handle(queues: Queues, message: Message): Promise<Outcome> {
+  /** One span per message, continuing the producer's trace when the message carries one. */
+  private handle(queues: Queues, message: Message): Promise<Outcome> {
+    const attributes = message.MessageAttributes;
+    const parent = contextFrom({
+      traceparent: attributes?.traceparent?.StringValue,
+      tracestate: attributes?.tracestate?.StringValue,
+    });
+    return inSpan(
+      `process ${this.config.sqs.queues.wagerTransactions}`,
+      {
+        kind: SpanKind.CONSUMER,
+        attributes: {
+          [MESSAGING.system]: "aws_sqs",
+          [MESSAGING.destination]: this.config.sqs.queues.wagerTransactions,
+          [MESSAGING.operation]: "process",
+          [MESSAGING.messageId]: message.MessageId ?? "",
+          "wagering.receive_count": Number(message.Attributes?.ApproximateReceiveCount ?? "1"),
+        },
+      },
+      () => this.handleInSpan(queues, message),
+      parent,
+    );
+  }
+
+  private async handleInSpan(queues: Queues, message: Message): Promise<Outcome> {
     const parsed = parseMessage(message.Body);
     if (!parsed.ok) {
       this.logger.warn({ reason: parsed.reason, errors: parsed.errors }, "message refused");
       return this.deadLetter(queues, message, parsed.reason);
     }
     const { messageId, data } = parsed.message;
+    trace.getActiveSpan()?.setAttribute("wagering.message_id", messageId);
     const correlationId = resolveCorrelationId(
       message.MessageAttributes?.correlationId?.StringValue,
     );
@@ -249,11 +276,13 @@ export class WagerTransactionConsumer
   ): Promise<Outcome> {
     const startedAt = performance.now();
     try {
-      const result = await this.useCases.submitWagerTransaction.execute({
-        ...request.data,
-        correlationId,
-        message: { consumerName: CONSUMER_NAME, messageId: request.messageId },
-      });
+      const result = await this.telemetry.traceSubmission("sqs", request.data, () =>
+        this.useCases.submitWagerTransaction.execute({
+          ...request.data,
+          correlationId,
+          message: { consumerName: CONSUMER_NAME, messageId: request.messageId },
+        }),
+      );
       this.telemetry.submitted("sqs", result, elapsedSeconds(startedAt));
       annotateContext({ transactionId: result.transaction.id });
       this.logger.info(
@@ -273,6 +302,7 @@ export class WagerTransactionConsumer
       // Test seam (NODE_ENV=test only): the window between commit and acknowledgement.
       await Bun.sleep(this.config.consumer.ackDelayMs);
     }
+    markOutcome("acknowledged");
     await this.acknowledge(queues.inbound, message);
     return "done";
   }
@@ -287,6 +317,7 @@ export class WagerTransactionConsumer
       // It keeps the visibility timeout of its receive instead of the short backoff, so the
       // instances that have not noticed the outage yet do not receive it again meanwhile.
       this.metrics.retries.inc({ operation: "sqs_message", reason: "dependency_unavailable" });
+      markOutcome("outage");
       this.logger.warn({ err: error }, "a dependency is unavailable: the message will be retried");
       return "outage";
     }
@@ -307,6 +338,7 @@ export class WagerTransactionConsumer
   /** Full-jitter backoff on the visibility timeout, from the receive count SQS keeps. */
   private async retryLater(queueUrl: string, message: Message, reason: string): Promise<void> {
     this.metrics.retries.inc({ operation: "sqs_message", reason });
+    markOutcome("rescheduled", { "wagering.retry_reason": reason });
     const receives = Number(message.Attributes?.ApproximateReceiveCount ?? "1");
     const delayMs = this.retryBackoff.delayMs(Math.max(0, receives - 1));
     try {
@@ -352,6 +384,7 @@ export class WagerTransactionConsumer
       return "done";
     }
     this.metrics.deadLettered.inc({ reason });
+    markOutcome("dead_lettered", { "wagering.dead_letter_reason": reason });
     await this.acknowledge(queues.inbound, message);
     return "done";
   }
@@ -413,6 +446,11 @@ export class WagerTransactionConsumer
       return false;
     }
   }
+}
+
+/** How the message of the active process span was settled. */
+function markOutcome(outcome: string, attributes: Attributes = {}): void {
+  trace.getActiveSpan()?.setAttributes({ "wagering.message.outcome": outcome, ...attributes });
 }
 
 function deadLetterAttributes(

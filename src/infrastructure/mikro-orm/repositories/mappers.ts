@@ -217,6 +217,7 @@ export function outboxMessageFromRow(row: OutboxMessageRow): OutboxMessage {
     attempts: row.attempts,
     nextAttemptAt: present(row.nextAttemptAt),
     publishedAt: present(row.publishedAt),
+    traceContext: present(row.traceContext),
   });
 }
 
@@ -229,6 +230,7 @@ export function outboxMessageRow(message: OutboxMessage) {
     payload: { ...message.payload },
     occurredAt: message.occurredAt,
     ...outboxMessageSchedule(message),
+    traceContext: message.traceContext === undefined ? null : { ...message.traceContext },
   };
 }
 

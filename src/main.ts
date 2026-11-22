@@ -10,6 +10,7 @@ import { type AppConfig, ConfigError, loadConfig } from "./infrastructure/config
 import { createLogger } from "./infrastructure/observability/logger";
 import { PinoNestLogger } from "./infrastructure/observability/nest-logger";
 import { RequestContextMiddleware } from "./infrastructure/observability/request-context.middleware";
+import { startTracing, type Tracing } from "./infrastructure/observability/tracing";
 import { validationIssue } from "./interfaces/contracts";
 import { bodyParserErrorHandler } from "./interfaces/http/problem-details";
 
@@ -19,9 +20,9 @@ import { bodyParserErrorHandler } from "./interfaces/http/problem-details";
  * processes too. APP_ROLES selects the rest: `api` mounts the wagering API; `consumer`, `outbox`
  * and `retry` start the SQS consumer and the background workers.
  */
-async function bootstrap(config: AppConfig, logger: Logger): Promise<void> {
+async function bootstrap(config: AppConfig, logger: Logger, tracing: Tracing): Promise<void> {
   const app = await NestFactory.create<NestExpressApplication>(
-    AppModule.forRoot(config, logger),
+    AppModule.forRoot(config, logger, tracing),
     // The JSON parser is registered below, after the request context and with a size limit.
     { logger: new PinoNestLogger(logger), bodyParser: false },
   );
@@ -42,7 +43,10 @@ async function bootstrap(config: AppConfig, logger: Logger): Promise<void> {
   app.enableShutdownHooks();
   await app.listen(config.port);
   const { port } = app.getHttpServer().address() as AddressInfo;
-  logger.info({ port, roles: config.roles }, "http server listening");
+  logger.info(
+    { port, roles: config.roles, tracing: config.tracing.endpoint !== undefined },
+    "http server listening",
+  );
 
   // NestJS closes the application on SIGTERM and SIGINT. This watchdog bounds that shutdown, so
   // a stuck dependency cannot keep the process alive past the orchestrator's grace period.
@@ -69,6 +73,8 @@ try {
 }
 
 const logger = createLogger(config.logLevel);
+// Before NestJS, so the context manager is in place for every span the application starts.
+const tracing = startTracing(config.tracing);
 
 process.on("unhandledRejection", (reason) => {
   logger.fatal({ err: reason }, "unhandled promise rejection");
@@ -76,7 +82,7 @@ process.on("unhandledRejection", (reason) => {
 });
 
 try {
-  await bootstrap(config, logger);
+  await bootstrap(config, logger, tracing);
 } catch (error) {
   logger.fatal({ err: error }, "bootstrap failed");
   process.exit(1);

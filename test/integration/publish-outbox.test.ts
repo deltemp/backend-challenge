@@ -122,8 +122,13 @@ describe("PublishOutbox", () => {
       for (const [index, message] of group.entries()) {
         expect(message.Attributes?.MessageDeduplicationId).toBe(envelopes[index].eventId);
         expect(message.MessageAttributes?.eventType?.StringValue).toBe(envelopes[index].eventType);
+        // Tracing is off in this process: no trace context is stored, so none is sent.
+        expect(Object.keys(message.MessageAttributes ?? {})).toEqual(["eventType"]);
       }
     }
+    expect(
+      await sql`select count(*)::int as traced from outbox_messages where trace_context is not null`,
+    ).toEqual([{ traced: 0 }]);
   });
 
   test("a failed publication is rescheduled with backoff, never dropped, and retried when due", async () => {

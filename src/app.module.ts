@@ -5,6 +5,7 @@ import { ConfigModule } from "./infrastructure/config/config.module";
 import { DependencyProbesModule } from "./infrastructure/dependency-probes.module";
 import { DatabaseModule } from "./infrastructure/mikro-orm/database.module";
 import { ObservabilityModule } from "./infrastructure/observability/observability.module";
+import type { Tracing } from "./infrastructure/observability/tracing";
 import { SqsModule } from "./infrastructure/sqs/sqs.module";
 import { UseCasesModule } from "./infrastructure/use-cases.module";
 import { HttpModule } from "./interfaces/http/http.module";
@@ -20,13 +21,13 @@ import { ReferenceRetryModule } from "./interfaces/workers/reference-retry.modul
  */
 @Module({})
 export class AppModule {
-  static forRoot(config: AppConfig, logger: Logger): DynamicModule {
+  static forRoot(config: AppConfig, logger: Logger, tracing: Tracing): DynamicModule {
     const roles = new Set(config.roles);
     return {
       module: AppModule,
       imports: [
         ConfigModule.forRoot(config),
-        ObservabilityModule.forRoot(logger),
+        ObservabilityModule.forRoot(logger, tracing),
         DatabaseModule,
         SqsModule,
         DependencyProbesModule,

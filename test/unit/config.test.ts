@@ -58,6 +58,36 @@ describe("loadConfig", () => {
     });
     expect(config.referenceRetry).toEqual({ batchSize: 50, pollIntervalMs: 1000 });
     expect(config.outageBackoff).toEqual({ baseMs: 1000, capMs: 30_000 });
+    expect(config.tracing).toEqual({
+      endpoint: undefined,
+      serviceName: "wagering-processor",
+      sampleRatio: 1,
+      exportDelayMs: 5000,
+    });
+  });
+
+  test("turns tracing on with an http(s) collector URL, and refuses any other", () => {
+    const config = loadConfig({
+      ...MINIMAL,
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-lgtm:4318",
+      TRACING_SAMPLE_RATIO: "0.25",
+    });
+
+    expect(config.tracing).toMatchObject({ endpoint: "http://otel-lgtm:4318", sampleRatio: 0.25 });
+    for (const endpoint of ["otel-lgtm:4318", "grpc://otel-lgtm:4317"]) {
+      expect(configError({ ...MINIMAL, OTEL_EXPORTER_OTLP_ENDPOINT: endpoint }).message).toContain(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+      );
+    }
+  });
+
+  test("bounds the sample ratio between 0 and 1", () => {
+    for (const ratio of ["-0.1", "1.5", "half"]) {
+      expect(configError({ ...MINIMAL, TRACING_SAMPLE_RATIO: ratio }).message).toContain(
+        "TRACING_SAMPLE_RATIO",
+      );
+    }
+    expect(loadConfig({ ...MINIMAL, TRACING_SAMPLE_RATIO: "0" }).tracing.sampleRatio).toBe(0);
   });
 
   test("rejects a consumer or outage backoff cap below its base", () => {

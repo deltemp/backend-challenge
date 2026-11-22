@@ -14,6 +14,8 @@ export interface AppProcess {
   readonly baseUrl: string;
   /** The last lines the process wrote, to explain a failure. */
   outputTail(): string;
+  /** Every line the process wrote so far, stdout and stderr interleaved. */
+  output(): readonly string[];
   waitUntilReady(timeoutMs?: number): Promise<void>;
   /**
    * Sends a signal and resolves with the exit code. On Windows every signal terminates the
@@ -32,9 +34,11 @@ const REQUIRED_VARIABLES = [
   "SQS_WAGER_TRANSACTIONS_DLQ",
   "SQS_WAGER_EVENTS_QUEUE",
 ];
-// Inherited variables an instance must never see: the LocalStack token is useless to it, and
-// MIKRO_ORM_* would override the validated configuration.
-const WITHHELD_VARIABLES = [/^LOCALSTACK_/, /^MIKRO_ORM_/];
+// Inherited variables an instance must never see: the LocalStack token is useless to it,
+// MIKRO_ORM_* would override the validated configuration, and OTEL_* would make it export spans
+// (and the SDK read its own settings) from whatever the developer's shell holds. A test that
+// wants tracing passes the endpoint itself.
+const WITHHELD_VARIABLES = [/^LOCALSTACK_/, /^MIKRO_ORM_/, /^OTEL_/];
 
 function childEnvironment(environment: Record<string, string>): Record<string, string> {
   const missing = REQUIRED_VARIABLES.filter((name) => !environment[name]);
@@ -104,6 +108,7 @@ export async function startApp(
     pid: child.pid,
     baseUrl,
     outputTail,
+    output: () => [...lines],
     waitUntilReady: (timeoutMs = 15_000) => waitUntilReady(baseUrl, timeoutMs, outputTail),
     stop: async (signal = "SIGTERM") => {
       if (child.exitCode === null) {

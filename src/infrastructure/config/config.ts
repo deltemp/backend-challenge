@@ -67,6 +67,12 @@ const environmentSchema = z
     OUTAGE_BACKOFF_BASE_MS: integer(1, 3_600_000).default(1000),
     OUTAGE_BACKOFF_CAP_MS: integer(1, 3_600_000).default(30_000),
     TEST_CONSUMER_ACK_DELAY_MS: integer(0, 60_000).default(0),
+    OTEL_EXPORTER_OTLP_ENDPOINT: z
+      .url({ protocol: /^https?$/, error: "must be an http(s):// URL" })
+      .optional(),
+    OTEL_SERVICE_NAME: z.string().min(1).max(100).default("wagering-processor"),
+    TRACING_SAMPLE_RATIO: z.coerce.number().min(0).max(1).default(1),
+    TRACING_EXPORT_DELAY_MS: integer(10, 60_000).default(5000),
   })
   .superRefine((env, context) => {
     const backoffs = [
@@ -194,6 +200,16 @@ export interface ReferenceRetryWorkerConfig {
   readonly pollIntervalMs: number;
 }
 
+export interface TracingConfig {
+  /** OTLP/HTTP collector base URL. Undefined turns tracing off: the API stays a no-op. */
+  readonly endpoint: string | undefined;
+  readonly serviceName: string;
+  /** Share of new traces recorded; a caller's sampling decision is followed. */
+  readonly sampleRatio: number;
+  /** Delay between two span exports. */
+  readonly exportDelayMs: number;
+}
+
 export interface AppConfig {
   readonly nodeEnv: "development" | "test" | "production";
   readonly port: number;
@@ -211,6 +227,7 @@ export interface AppConfig {
   readonly referenceRetry: ReferenceRetryWorkerConfig;
   /** Pacing of the background loops while PostgreSQL or SQS is unavailable. */
   readonly outageBackoff: BackoffSettings;
+  readonly tracing: TracingConfig;
 }
 
 /** Invalid configuration. The message names each variable and the rule it breaks, never its value. */
@@ -306,5 +323,11 @@ export function loadConfig(environment: Readonly<Record<string, string | undefin
       pollIntervalMs: env.REFERENCE_RETRY_POLL_INTERVAL_MS,
     },
     outageBackoff: { baseMs: env.OUTAGE_BACKOFF_BASE_MS, capMs: env.OUTAGE_BACKOFF_CAP_MS },
+    tracing: {
+      endpoint: env.OTEL_EXPORTER_OTLP_ENDPOINT,
+      serviceName: env.OTEL_SERVICE_NAME,
+      sampleRatio: env.TRACING_SAMPLE_RATIO,
+      exportDelayMs: env.TRACING_EXPORT_DELAY_MS,
+    },
   };
 }

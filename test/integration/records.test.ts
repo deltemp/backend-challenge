@@ -19,6 +19,7 @@ import { ledgerDiscrepancies } from "../support/ledger";
 // written through MikroORM satisfies the deferred checks at commit, in whatever order it flushes.
 
 const uuid = (): string => Bun.randomUUIDv7();
+const TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
 describe("persistence records", () => {
   let database: TestDatabase | undefined;
@@ -122,6 +123,7 @@ describe("persistence records", () => {
           },
           occurredAt: now,
           nextAttemptAt: now,
+          traceContext: { traceparent: TRACEPARENT },
         });
         em.create(LedgerEntryRecord, {
           id: ids.entry,
@@ -177,6 +179,7 @@ describe("persistence records", () => {
     });
     expect(BigInt(event.sequenceNumber) > 0n).toBe(true);
     expect(event).toMatchObject({ attempts: 0, publishedAt: null });
+    expect(event.traceContext).toEqual({ traceparent: TRACEPARENT });
   });
 
   test("the inbox is keyed by consumer and message id", async () => {

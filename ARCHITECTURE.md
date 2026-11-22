@@ -4,13 +4,13 @@ This document records the architectural decisions of the Distributed Wagering Pr
 
 ## Implementation status
 
-Every mandatory requirement is implemented; tracing and the full load test come next:
+Every mandatory requirement is implemented, and so is tracing; the full load test comes next:
 
 | Area | Status |
 |---|---|
 | Configuration, structured logs, metrics, health checks, graceful shutdown | Implemented; shutdown tested in a container |
 | MikroORM setup, migration tooling, SQS queue provisioning | Implemented |
-| Docker Compose stack (provision job, 3 replicas, nginx, k6 profile) | Implemented |
+| Docker Compose stack (provision job, 3 replicas, nginx, k6 and observability profiles) | Implemented |
 | Test harness (per-file databases and queues, real processes) | Implemented |
 | Authentication extension point | `AuthGuard` implemented; `ProviderIdentityPort` pending |
 | Domain model: `Money`, `Wallet`, ledger, `WagerTransaction` and its rules, events, inbox and outbox | Implemented, unit-tested |
@@ -18,7 +18,8 @@ Every mandatory requirement is implemented; tracing and the full load test come 
 | Use cases (wallets, transactions, queries, reconciliation, reference retries, outbox publishing), repositories, unit of work, SQS event publisher | Implemented, tested on PostgreSQL and LocalStack |
 | Wagering HTTP API, with RFC 9457 error responses | Implemented, tested over HTTP on a real process |
 | SQS consumer, outbox publisher, reference retry worker, business metrics | Implemented, tested with real processes, including the multi-process scenarios of §13 |
-| OpenTelemetry tracing, load test | Deferred until the mandatory scope is green (k6 wiring exists) |
+| OpenTelemetry tracing (HTTP, use cases, SQL transactions, outbox, SQS) and the Grafana dashboard | Implemented, tested with a real process exporting to an OTLP receiver |
+| Load test | A smoke run (the k6 wiring exists); the full test comes next |
 
 ## 1. Overview
 
@@ -44,6 +45,7 @@ flowchart LR
       events[["wager-events.fifo"]]
     end
     provision[/"provision job: migrations and queues"/]
+    lgtm[("otel-lgtm, optional profile: collector, Tempo, Prometheus, Grafana")]
   end
   providers -->|HTTP| nginx
   nginx --> api
@@ -57,6 +59,8 @@ flowchart LR
   outbox --> events
   provision --> pg
   provision --> sqs
+  replicas -.->|spans over OTLP| lgtm
+  lgtm -.->|scrapes each replica| replicas
 ```
 
 ## 2. Stack
@@ -72,6 +76,7 @@ flowchart LR
 | Validation | Zod, through NestJS 12 Standard Schema support | One schema per contract, shared by the HTTP entry point and the SQS consumer. |
 | Decimal arithmetic | decimal.js, only inside `Money` | Exact decimal arithmetic; see [section 4.1](#41-money). |
 | Logs, metrics, health | pino, prom-client, `@nestjs/terminus` | Structured JSON logs, Prometheus metrics and separate liveness and readiness (§12). |
+| Tracing | OpenTelemetry (API 1.10, SDK 3.1), OTLP over HTTP; grafana/otel-lgtm in an optional Compose profile | Vendor-neutral spans and W3C context propagation; one container gives a collector, Tempo, Prometheus and Grafana for local use. See [section 14](#14-observability-12). |
 | Lint and format | Biome | One fast tool for both, run with zero warnings allowed. |
 | Proxy | nginx | Familiar to most reviewers; its configuration is explained in [section 13](#13-runtime-topology-and-operations). |
 | Load test | k6 in a container | A recognized methodology, and nothing to install on the host. |
@@ -168,7 +173,7 @@ The row also carries the wallet side of the movement: the direction, `balance_be
 
 ### 4.5 Inbox, outbox and integration events
 
-`InboxMessage` records each consumed SQS message under `(consumerName, messageId)`. `OutboxMessage` stores an integration event inside the financial transaction, with its publication attempts and the time of its next attempt.
+`InboxMessage` records each consumed SQS message under `(consumerName, messageId)`. `OutboxMessage` stores an integration event inside the financial transaction, with its publication attempts, the time of its next attempt and, when that transaction was traced, its trace context, which is opaque to the domain ([section 14](#14-observability-12)).
 
 Integration events extend the abstract `IntegrationEvent<T>`, with one concrete subclass per event. The event type and version are declared on the class, never as strings at the call site. Payloads carry `MoneyProps` (decimal strings), never `Money` instances, so they stay stable, versionable JSON (§11).
 
@@ -272,7 +277,7 @@ The inbox row (SQS entry only), the wager transaction, the wallet balance and ve
 
 ### Schema guarantees (§5, item 9)
 
-Uniqueness, immutability and non-negativity are enforced by PostgreSQL, not only by application code. The first migration creates six tables (`wallets`, `ledger_accounts`, `wager_transactions`, `ledger_entries`, `inbox_messages`, `outbox_messages`) and these guarantees, each proved by `test/integration/schema.test.ts` with raw SQL that bypasses the application:
+Uniqueness, immutability and non-negativity are enforced by PostgreSQL, not only by application code. The first migration creates six tables (`wallets`, `ledger_accounts`, `wager_transactions`, `ledger_entries`, `inbox_messages`, `outbox_messages`) and these guarantees; the second adds the outbox's trace context. Each guarantee is proved by `test/integration/schema.test.ts` with raw SQL that bypasses the application:
 
 | Guarantee | Mechanism |
 |---|---|
@@ -286,6 +291,7 @@ Uniqueness, immutability and non-negativity are enforced by PostgreSQL, not only
 | Message deduplication | primary key `(consumer_name, message_id)` in the inbox |
 | Append-only ledger | trigger rejecting `UPDATE`, `DELETE` and `TRUNCATE`, on entries and on accounts |
 | No confirmed event is lost | trigger: an unpublished outbox row cannot be deleted or truncated, and only its publication schedule changes (attempts only go up); a published row is final and may then be purged |
+| An event keeps its trace | the outbox `trace_context` is null or a JSON object (`CHECK`), and the same trigger freezes it with the event's other columns |
 | Terminal transactions stay final | trigger: only a `PENDING_REFERENCE` row may change, and then only its outcome (status, failure code, observed balance, schedule); its deadline is fixed; nothing is deleted; `FAILED` is reachable only by that update |
 | Wallets keep their identity | trigger: owner, currency and creation time never change; wallets are never deleted |
 | Valid states | `CHECK`s: `PENDING` is never stored; failure codes only on `REJECTED` (never `INTERNAL_ERROR`) and `FAILED` (always `INTERNAL_ERROR`); `processed_at` exactly on `PROCESSED`; a parked row has a deadline and a next attempt no later than it; reference rules per kind; provider fields null only for `OPENING`; no observed balance on a wallet mismatch |
@@ -313,7 +319,7 @@ Records declare columns, primary keys and plain unique constraints, and nothing 
 
 ### Migrations and connections
 
-- **Migrations** are MikroORM migrations whose SQL is reviewed by hand, and every one is reversible. A test applies all of them to an empty database, reverts them completely and applies them again, comparing a fingerprint of the schema catalog (relations, types, functions, triggers, constraints, extensions). A `down()` that forgets a trigger function fails it.
+- **Migrations** are MikroORM migrations whose SQL is reviewed by hand, and every one is reversible. A test applies them to an empty database one at a time, reverts them one at a time and applies them again, comparing a fingerprint of the schema catalog after every step: relations, columns, index, trigger and constraint definitions, types, function bodies (whitespace aside) and extensions. Each `down()` must leave exactly the schema the migrations before it built, so one that forgets a trigger function, or restores a function by name but not its body, fails it.
 - **Application processes never run DDL.** MikroORM's `ensureDatabase` is off: databases come from Compose or the test harness, and the schema only from migrations.
 - **Connections are bounded.** A 5-second connection timeout makes an unreachable database fail fast as a transient error. A 30-second `idle_in_transaction_session_timeout` lets PostgreSQL release the row locks of a process that stalled or vanished in the middle of a transaction.
 - **Statements are bounded too.** The application's sessions run with a 2-second `lock_timeout` ([section 7](#7-concurrency-8)) and a 5-second `statement_timeout`, which stops a runaway query, such as a large ledger page or a reconciliation, from holding a connection. The pg driver sends both as session settings when the application's pool opens a connection; the migration scripts open their own connections without them. Both are configurable.
@@ -343,7 +349,7 @@ All three are FIFO queues with content-based deduplication off, so senders must 
 
   The redrive policy caps the retries at 5 receives, at most about 2 min 15 s.
 - **Dead-lettering is a copy and a delete.** SQS has no call that moves a message to the DLQ, so the consumer sends a copy (same body, group and attributes, the original SQS message id as `MessageDeduplicationId`, and a `deadLetterReason` attribute) and then deletes the original. A crash in between leaves a duplicate in the DLQ, never a lost message, and the deduplication id absorbs it within five minutes. Messages moved by the redrive policy carry no reason: they ran out of receives.
-- Messages of one group, a wallet, are processed in order; the groups of a batch in parallel. When one meets a busy wallet, the rest of its group in the batch is handed back at once: FIFO delivers none of a group while its head is invisible, so a later bet cannot overtake an earlier one that met a lock timeout, and the neighbours would have met the same lock anyway. After a bug the group goes on: held back, the neighbours of a message bound for the DLQ would spend their receives along with it and follow it there. A sporadic bug can then let a later message overtake it, which the rules tolerate (an out-of-order reversal waits in `PENDING_REFERENCE`). A `correlationId` message attribute is kept when it is safe to log, like the HTTP header.
+- Messages of one group, a wallet, are processed in order; the groups of a batch in parallel. When one meets a busy wallet, the rest of its group in the batch is handed back at once: FIFO delivers none of a group while its head is invisible, so a later bet cannot overtake an earlier one that met a lock timeout, and the neighbours would have met the same lock anyway. After a bug the group goes on: held back, the neighbours of a message bound for the DLQ would spend their receives along with it and follow it there. A sporadic bug can then let a later message overtake it, which the rules tolerate (an out-of-order reversal waits in `PENDING_REFERENCE`). A `correlationId` message attribute is kept when it is safe to log, like the HTTP header, and a `traceparent` attribute makes the message's processing part of the producer's trace.
 - **It pauses during outages.** While PostgreSQL or SQS is unreachable, the consumer stops receiving and probes the dependency with backoff before resuming. Every receive counts against the redrive limit, so the consumer checks PostgreSQL before each one; a failed check, a failed receive or a message that fails with `DEPENDENCY_UNAVAILABLE` starts the pause. That message keeps the visibility timeout of its receive rather than the short per-message backoff, so the instances that have not noticed the outage yet do not receive it meanwhile (no long poll opened before the outage can return it, as long as the visibility timeout outlasts the long poll plus the processing of a message: the configuration refuses a timeout that does not outlast the long poll, and the defaults of 30 and 20 seconds leave 10 for the processing), and the rest of the batch comes back after its visibility timeout. Without this, an outage of a few minutes would use up the 5 receives of every message in flight, one per instance, and push healthy messages to the DLQ, where they would need a manual redrive. At worst, an instance that received just as the outage began spends one receive of each message of that batch. Per-message backoff is left for isolated failures, such as a lock timeout.
 - Producers are expected to use `walletId` as `MessageGroupId`, which preserves per-wallet order and parallelizes across wallets. Correctness does not depend on it.
 - On `SIGTERM` it stops polling, finishes the messages in flight, and hands the received ones it has not started back at once (visibility 0), so another instance takes them without waiting. The queue's 20-second long poll is longer than the 10-second shutdown budget, so every receive gets an `AbortSignal` that shutdown aborts first.
@@ -351,7 +357,7 @@ All three are FIFO queues with content-based deduplication off, so senders must 
 ### Transactional outbox (§11)
 
 - Events are written to the outbox inside the financial transaction, and nothing is published before the commit (§5, item 4).
-- Publishers on every instance claim due rows with `FOR UPDATE SKIP LOCKED`, so they never block each other. Each round claims at most one event per wallet, the head of its queue, and holds those row locks while it publishes to `wager-events.fifo` (`SendMessageBatch`, ten at a time) with `MessageGroupId = walletId`, `MessageDeduplicationId = eventId`, the envelope as the body and an `eventType` attribute; then it marks each row published or reschedules it, in the same SQL transaction. If the publisher dies mid-round, the transaction rolls back, the locks go, and the events are published again by another instance.
+- Publishers on every instance claim due rows with `FOR UPDATE SKIP LOCKED`, so they never block each other. Each round claims at most one event per wallet, the head of its queue, and holds those row locks while it publishes to `wager-events.fifo` (`SendMessageBatch`, ten at a time) with `MessageGroupId = walletId`, `MessageDeduplicationId = eventId`, the envelope as the body, an `eventType` attribute and, when the transaction that wrote the event was traced, its `traceparent` and `tracestate`; then it marks each row published or reschedules it, in the same SQL transaction. If the publisher dies mid-round, the transaction rolls back, the locks go, and the events are published again by another instance.
 - **Per-wallet order.** Only the oldest unpublished event of each wallet is eligible for publication, ordered by a database sequence assigned at insert, under the wallet lock. UUIDv7 cannot order events: it follows each instance's clock, which can disagree with the commit order. Concurrent publishers therefore never hold two events of the same wallet, and `wager-events.fifo` receives each wallet's events in commit order, which is what makes it worth being a FIFO queue. The cost is that an event that keeps failing holds back the later events of its wallet, and only of that wallet, until it is published. The 10-attempt gauge raises the alert.
 - If a process dies after the commit but before publishing, the rows stay pending and another instance publishes them.
 - Delivery is at-least-once. A publication repeated after a crash carries the same `eventId`, so SQS deduplicates it within its 5-minute window, and consumers deduplicate on `eventId` beyond it.
@@ -501,6 +507,7 @@ No user table or password hashing is ever built. Messages from the queue are a t
 | `app` × 3 | Starts only after `provision` succeeds; healthy only when ready; restarted unless stopped |
 | `proxy` | nginx on port 3000, in front of the replicas |
 | `k6` | Load-test runner, under the `load` profile |
+| `otel-lgtm` | Under the `observability` profile: an OpenTelemetry Collector, Tempo, Prometheus and Grafana (port 3001) in one container ([section 14](#14-observability-12)) |
 
 - **Migrations run once.** Running them in a one-shot job means replicas never race to migrate, and application processes never run DDL.
 - **nginx resolves the replicas once, at startup.** Dynamic re-resolution was tried and dropped: when a replica was killed, Docker removed its address while nginx was still waiting on it, and the retry then failed with "no live upstreams". With a static list, nginx retries the request on a live replica, and Compose restarts the proxy whenever it recreates the replicas. nginx moves a request to another replica only when the first cannot be reached. It never resends a request that already reached a replica, so a `POST` cannot be duplicated. A replica that dies loses only the requests it was serving, and clients retry those with the same idempotency key.
@@ -537,7 +544,13 @@ No user table or password hashing is ever built. Messages from the queue are a t
   - Labels never carry amounts or unbounded identifiers.
   - Metrics must be read from each replica, never through the proxy, which hands each scrape to a different replica.
   - Gauges of shared state (outbox backlog and lag, events over the attempt threshold, DLQ depth, pending references) are read from PostgreSQL or SQS at scrape time, so every replica reports the same value. A failed read is logged and leaves the gauge as it was; it never fails the scrape. The lag compares the database's clock with the `occurred_at` each instance wrote from its own, so clock skew shifts it; it is floored at zero.
-- **Tracing** with OpenTelemetry is deferred until the mandatory scope is green. It will use manual spans from HTTP through the use case, the SQL transaction, the outbox and SQS, with trace context propagated in messages, plus a Grafana dashboard in an optional Compose profile. Spans have to be manual: the official NestJS instrumentation does not support NestJS 12 yet, and automatic instrumentation is fragile on the Bun runtime.
+- **Tracing** uses OpenTelemetry with manual spans: the official NestJS instrumentation does not support NestJS 12 yet, and automatic instrumentation is fragile on the Bun runtime. It is on when `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector. Otherwise nothing is registered: the OpenTelemetry API stays a no-op, and no trace context is stored, sent or continued.
+  - **Spans.** A server span per HTTP request (probes and scrapes excepted), continuing the caller's W3C `traceparent`; a consumer span per SQS message, continuing its `traceparent` attribute; a use-case span (`SubmitWagerTransaction`, `ReprocessPendingReference`), opened by the interface that calls the use case, so use cases stay free of tracing as they are of logs and metrics; a `db.transaction` span around each unit of work; and a producer span per publication to `wager-events.fifo`. A unit of work gets its span only under another span, so the workers' polls (due events, due references) start no traces of their own. A reprocessing and a publication are each a trace of their own: they are jobs of a worker, not part of the request that caused them.
+  - **Through the outbox.** The outbox repository records the active trace context (`traceparent`, `tracestate`) in the event's row, in the same SQL transaction, and the publisher sends it as message attributes. Consumers of `wager-events.fifo` therefore continue the trace of the request or message that caused each event, and every publication span links to the traces of the events it sends. The context is part of the event, so the schema freezes it with the other event columns; an untraced transaction stores null.
+  - **What spans carry.** Ids, kinds, statuses, failure codes and messaging attributes; never amounts or payloads, which a test checks on every attribute of every span. A refused request (a conflict, a validation failure, an unknown wallet) records its code as `error.type` but is an outcome, not a failed span. A bug or a transient failure fails the span, and its exception goes through the log serializer first, so database row values never reach a trace.
+  - **Logs lead to traces.** Every log line written inside a traced span carries its `traceId` and `spanId`, and the access log line carries the request's `traceId`.
+  - **Sampling and export.** A caller's sampling decision is followed; new traces are sampled at `TRACING_SAMPLE_RATIO` (1 by default). Finished spans are exported in batches over OTLP/HTTP every `TRACING_EXPORT_DELAY_MS` (5 s). A failed export is dropped silently and never delays a request, so Compose points the replicas at the collector of the `observability` profile whether or not that profile runs; a test proves that an instance whose collector hangs up on every export keeps serving, without logging errors.
+- **Dashboard.** `docker compose --profile observability up` adds the grafana/otel-lgtm container. Its OpenTelemetry Collector receives the spans and stores them in Tempo, and its Prometheus scrapes the `/metrics` of each replica, found through Docker's DNS, never through the proxy. Grafana opens on a provisioned dashboard with the metrics above (transactions by status, source and kind, latency percentiles, duplicates, lock conflicts, retries, outbox lag and throughput, DLQ depth and dead letters, pending references, paused consumers, unexpected errors and divergences, HTTP status codes) and with tables of recent submissions and of failed traces, which open in Tempo.
 
 ## 15. Testing strategy (§13)
 
@@ -546,6 +559,7 @@ No user table or password hashing is ever built. Messages from the queue are a t
 - **Real processes.** Application instances run as real OS processes built from the current sources, so multi-instance scenarios use real parallelism and crash scenarios use `SIGKILL`.
   - Windows cannot deliver a catchable `SIGTERM`, so graceful shutdown is tested in a container: the test builds the image from the current sources, runs a consumer on the compose network against its own database and queues, and stops it with `docker stop` while a message waits for its acknowledgement.
 - **The interfaces are tested over their real transports.** `http-api.test.ts` drives every status code and problem code through HTTP; `sqs-consumer.test.ts` covers the inbox and redelivery, rejections, each permanent error and its dead-letter reason, transient retries, the redrive policy, and a consumer that pauses before receiving while PostgreSQL is unreachable, so the outage spends no receive; `workers.test.ts` covers publication in commit order, a reversal applied once its reference arrives, and the deadline.
+- **Tracing is tested end to end** (`test/integration/tracing.test.ts`): an instance exports its spans to an OTLP receiver inside the test. A submission over HTTP continues the caller's trace through the use case and its SQL transaction; its events reach `wager-events.fifo` with the context of that transaction, the caller's trace state included, and are sent in a producer span linked to it; a queue message continues its producer's trace, which its events carry on, without an invalid trace state; a reprocessing is a trace of its own; a busy wallet fails the spans and records the exception; log lines name their trace; probes are not traced, and no attribute of a span or of a recorded exception carries an amount; and an instance whose collector hangs up on every export keeps serving, without errors. Unit tests cover the propagation helpers, the span outcomes and the log fields, and the multi-process scenarios below run with tracing on, as in Compose.
 - **The multi-process scenarios of §13** (`test/concurrency/instances.test.ts`): §8 across instances, the same bet 50 times over HTTP and the queue on three instances, distinct wallets in parallel, a reversal before its reference across processes, a consumer killed between commit and acknowledgement, two publishers in two processes, and a restart of every instance mid-traffic.
 - **One test seam.** To kill a consumer exactly between commit and acknowledgement, `TEST_CONSUMER_ACK_DELAY_MS` holds each message after its commit; the test waits for the commit to appear, kills the process with `SIGKILL`, and checks that the redelivery is answered from the inbox. The configuration refuses it unless `NODE_ENV=test`, and it is the only test-only path in the application.
 - **Determinism.** Tests wait on observable conditions, never on `sleep`.
@@ -576,6 +590,7 @@ No user table or password hashing is ever built. Messages from the queue are a t
 - **LocalStack** requires an auth token to run the project, and keeps no state: if it restarts on its own, the queues are gone until `docker compose up` runs `provision` again.
 - **nginx** must be restarted after a change in the number of replicas.
 - **Metrics** are per process; reading them through the proxy gives a different replica's values each time.
+- **Tracing.** Spans exported while the collector is down are lost, and so are those still buffered when a process is killed. Logs are not shipped to Loki: they stay on stdout, with the trace id that leads to the trace. The otel-lgtm container is for local use: it keeps no data across `docker compose down`, runs Grafana with anonymous admin access (the image's default), and replaces the image's Prometheus configuration to add the scrape job, which must be kept in step when the image is upgraded.
 - **Currency.** Only `BRL` is exercised end to end.
 - **Authentication** is not implemented ([section 12](#12-authentication-2)).
 - **Scope.** Partial reversals are out of scope, as §7 (rule 5) allows.

@@ -35,6 +35,8 @@ export interface SendOptions {
   readonly groupId?: string;
   /** A new one by default, so SQS never drops a deliberate duplicate. */
   readonly deduplicationId?: string;
+  /** String message attributes, such as `correlationId` or `traceparent`. */
+  readonly attributes?: Readonly<Record<string, string>>;
 }
 
 /** Sends a body (an object is sent as JSON) to a FIFO queue. */
@@ -50,6 +52,15 @@ export async function sendMessage(
       MessageBody: typeof body === "string" ? body : JSON.stringify(body),
       MessageGroupId: options.groupId ?? "test-group",
       MessageDeduplicationId: options.deduplicationId ?? Bun.randomUUIDv7(),
+      MessageAttributes:
+        options.attributes === undefined
+          ? undefined
+          : Object.fromEntries(
+              Object.entries(options.attributes).map(([name, value]) => [
+                name,
+                { DataType: "String", StringValue: value },
+              ]),
+            ),
     }),
   );
 }

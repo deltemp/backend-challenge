@@ -18,6 +18,7 @@ import {
   wagerMessage,
 } from "../support/messaging";
 import { metricValue } from "../support/metrics";
+import { type OtlpReceiver, startOtlpReceiver } from "../support/otlp";
 import { createTestQueues, createTestSqsClient, type TestQueues } from "../support/queues";
 import { balanceOf, transactionCommand } from "../support/use-cases";
 
@@ -54,23 +55,30 @@ async function startInstances(
   return apps;
 }
 
-/** A database and a queue set of its own for one describe, and the instances it starts. */
+/**
+ * A database and a queue set of its own for one describe, and the instances it starts. The
+ * instances trace to an OTLP receiver of their own, as the compose replicas do to the collector,
+ * so these scenarios run with the spans around every unit of work, message and publication.
+ */
 function environmentPerDescribe() {
   const sqs = createTestSqsClient();
   const started: AppProcess[] = [];
   let database: TestDatabase | undefined;
   let queues: TestQueues | undefined;
   let sql: SQL | undefined;
+  let receiver: OtlpReceiver | undefined;
 
   beforeAll(async () => {
     database = await createTestDatabase();
     queues = await createTestQueues(sqs);
     sql = new SQL(database.url);
+    receiver = startOtlpReceiver();
   });
 
   afterAll(() =>
     cleanUp(
       () => Promise.all(started.map((app) => app.stop("SIGKILL"))),
+      () => receiver?.stop(),
       () => sql?.close(),
       () => queues?.delete(),
       () => database?.drop(),
@@ -82,6 +90,8 @@ function environmentPerDescribe() {
     if (sql !== undefined) {
       expect(await ledgerDiscrepancies(sql)).toEqual([]);
     }
+    // The instances did run with tracing on.
+    await receiver?.waitForSpan("a span from the instances", () => true);
   });
 
   return {
@@ -92,10 +102,24 @@ function environmentPerDescribe() {
       readonly queues: TestQueues;
       readonly env: Record<string, string>;
     } {
-      if (database === undefined || queues === undefined || sql === undefined) {
+      if (
+        database === undefined ||
+        queues === undefined ||
+        sql === undefined ||
+        receiver === undefined
+      ) {
         throw new Error("setup did not complete");
       }
-      return { sql, queues, env: { ...appEnvironment(database, queues), ...FAST } };
+      return {
+        sql,
+        queues,
+        env: {
+          ...appEnvironment(database, queues),
+          ...FAST,
+          OTEL_EXPORTER_OTLP_ENDPOINT: receiver.endpoint,
+          TRACING_EXPORT_DELAY_MS: "50",
+        },
+      };
     },
   };
 }

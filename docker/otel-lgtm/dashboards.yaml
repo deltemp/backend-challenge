@@ -1,0 +1,10 @@
+# Grafana provisioning for the observability profile: the wagering dashboard, next to the ones
+# grafana/otel-lgtm ships.
+apiVersion: 1
+
+providers:
+  - name: "Wagering processor"
+    type: file
+    options:
+      path: /otel-lgtm/wagering-dashboard.json
+      foldersFromFilesStructure: false

@@ -108,6 +108,27 @@ describe("OutboxMessage", () => {
     expect(message.nextAttemptAt).toEqual(new Date(at(50).getTime() + 30_000));
   });
 
+  test("carries the trace context it was persisted with, and records none itself", () => {
+    const message = enqueued();
+    const traceContext = { traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" };
+
+    const rehydrated = OutboxMessage.rehydrate({
+      id: message.id,
+      aggregateId: message.aggregateId,
+      orderingKey: message.orderingKey,
+      eventType: message.eventType,
+      payload: message.payload,
+      occurredAt: message.occurredAt,
+      attempts: 0,
+      nextAttemptAt: message.nextAttemptAt,
+      publishedAt: undefined,
+      traceContext,
+    });
+
+    expect(message.traceContext).toBeUndefined();
+    expect(rehydrated.traceContext).toEqual(traceContext);
+  });
+
   test("once published, it is neither due nor retried", () => {
     const message = enqueued();
 

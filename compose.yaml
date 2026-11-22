@@ -78,6 +78,10 @@ services:
       <<: *app-environment
       PORT: "3000"
       APP_ROLES: api,consumer,outbox,retry
+      # Spans go to the collector of the observability profile. Without that profile the exports
+      # fail in the background and the spans are dropped; requests do not wait for them.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-lgtm:4318
+      OTEL_SERVICE_NAME: wagering-processor
     depends_on:
       provision:
         condition: service_completed_successfully
@@ -112,6 +116,32 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+
+  # Traces, metrics and dashboards, outside the default stack: Grafana, Tempo, Prometheus and an
+  # OpenTelemetry Collector in one container. Start it with the rest:
+  #   docker compose --profile observability up -d --build --wait
+  # Grafana answers on http://localhost:3001 and keeps nothing across `docker compose down`.
+  otel-lgtm:
+    image: grafana/otel-lgtm:0.41.1
+    profiles: ["observability"]
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+      # OTLP over HTTP, for an instance started on the host (bun run dev).
+      - "${OTLP_HTTP_PORT:-4318}:4318"
+    environment:
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /otel-lgtm/wagering-dashboard.json
+    volumes:
+      # Its own Prometheus configuration plus a job that scrapes each replica.
+      - ./docker/otel-lgtm/prometheus.yaml:/otel-lgtm/prometheus.yaml:ro
+      - ./docker/otel-lgtm/dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/wagering.yaml:ro
+      - ./docker/otel-lgtm/wagering-dashboard.json:/otel-lgtm/wagering-dashboard.json:ro
+    healthcheck:
+      # The image's own check, run more often than its 30 s so `up --wait` returns sooner.
+      test: ["CMD", "/otel-lgtm/docker/healthcheck.sh"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
 
   # Load test runner, outside the default stack: bun run test:load
   k6:

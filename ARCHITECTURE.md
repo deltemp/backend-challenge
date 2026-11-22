@@ -13,7 +13,9 @@ The decisions below describe the target design. Only part of it exists today:
 | Docker Compose stack (provision job, 3 replicas, nginx, k6 profile) | Implemented |
 | Test harness (per-file databases and queues, real processes) | Implemented |
 | Authentication extension point | `AuthGuard` implemented; `ProviderIdentityPort` pending |
-| Domain model, schema migration, wagering API, reconciliation | Designed, not implemented |
+| Domain model: `Money`, `Wallet`, ledger, `WagerTransaction` and its rules, events, inbox and outbox | Implemented, unit-tested |
+| Persistence records and the first migration, with every schema guarantee of [section 8](#8-persistence-and-transactional-strategy) | Implemented, tested on PostgreSQL |
+| Use cases, repositories, wagering API, reconciliation | Designed, not implemented |
 | SQS consumer, outbox publisher, reference retry worker | Designed, not implemented |
 | RFC 9457 error responses | Designed, not implemented |
 | OpenTelemetry tracing, load test | Deferred until the mandatory scope is green (k6 wiring exists) |
@@ -85,7 +87,7 @@ src/infrastructure   adapters: MikroORM records and repositories, SQS, observabi
 src/interfaces       HTTP controllers, SQS consumer, background workers
 ```
 
-Dependencies point inward: `interfaces → application → domain`, and `infrastructure` implements the ports that `application` declares. `src/domain` depends on nothing but decimal.js.
+Dependencies point inward: `interfaces → application → domain`, and `infrastructure` implements the ports that `application` declares. `src/domain` depends on no package but decimal.js; it also uses Node's built-in `node:crypto` for the payload hash. A unit test scans its imports and fails on anything else.
 
 The code is one bounded context organized in layers, not a set of feature modules. The central use case writes the inbox row, the wager transaction, the wallet balance, the ledger entry and the outbox rows in a single SQL transaction. Splitting wallets, wagering and outbox into separate modules would draw boundaries straight through that transaction and force coordination between them, for no gain at this size.
 
@@ -109,7 +111,9 @@ Only `BRL` is exercised end to end, as §6.1 allows, but the model stays multi-c
 
 ### 4.2 Wallet
 
-`Wallet` is the aggregate root that owns the balance. There is at most one wallet per player and currency, and its currency never changes. `version` starts at 1 when the wallet is opened (the `OPENING` credit, when the initial balance is above zero, is part of the opening) and increments only when the balance changes. Every balance change produces exactly one ledger entry in the same SQL transaction.
+`Wallet` is the aggregate root that owns the balance. There is at most one wallet per player and currency, and its currency never changes. `version` starts at 1 when the wallet is opened (the `OPENING` credit, when the initial balance is above zero, is part of the opening) and increments only when the balance changes. Every balance change produces exactly one ledger entry in the same SQL transaction: `debit` and `credit` return the entry they produced, built and validated before the wallet changes, so a refused movement leaves the wallet untouched. A wallet opened at zero has no ledger entry, so its first movement is version 2.
+
+The business rules live in one function, `applyWagerTransaction`, which takes the locked wallet, the transaction, its resolved reference (if any) and the retry policy, and returns the outcome: `PROCESSED` with its ledger entry, `REJECTED` with its failure code, or `PENDING_REFERENCE`. It has no I/O; the use cases will load and lock what it needs and persist what it changed.
 
 ### 4.3 WagerTransaction and its state machine (§6.3)
 
@@ -131,7 +135,7 @@ stateDiagram-v2
 - `PROCESSED`, `REJECTED` and `FAILED` are terminal. Transitioning a terminal transaction throws `InvalidTransactionStateError`: it is a programming error, not a business path. The schema enforces the same rule with a trigger.
 - `PENDING` exists only inside the SQL transaction that creates the transaction, which ends in `PROCESSED`, `REJECTED` or `PENDING_REFERENCE` before it commits. A new transaction that fails on infrastructure is rolled back and never persisted. The caller gets a transient error and can resend safely.
 - `FAILED` is reserved for a transaction already persisted as `PENDING_REFERENCE` whose reprocessing hits an unrecoverable, non-business error. It carries `INTERNAL_ERROR` and stays auditable.
-- `OPENING` is internal. Submitting it through the API or the queue is an invalid payload.
+- `OPENING` is internal. Submitting it through the API or the queue is an invalid payload. It is created already `PROCESSED`, together with the wallet, and has no provider fields and no idempotency key: it records the initial balance, not a provider's operation. A partial unique index allows one per wallet.
 
 ### 4.4 Double-entry ledger
 
@@ -176,12 +180,15 @@ Integration events extend the abstract `IntegrationEvent<T>`, with one concrete 
 The rules of §7 apply as written. These interpretations go beyond the statement:
 
 1. **At most one reversal per referenced transaction.** §7 only forbids reversing a reference twice with the same operation, so read literally it would accept both a `REFUND` and a `ROLLBACK` of the same `BET`, and credit the player twice. Here a reference has at most one `PROCESSED` reversal, of either kind, enforced by a partial unique index. The second reversal is `REJECTED` with `REFERENCE_ALREADY_REVERSED`. Limitation: a `REFUND` undone by a `ROLLBACK` does not reopen the `BET` for a new `REFUND`.
-2. **`WIN` may carry a reference.** When it does, the reference must resolve to a `PROCESSED` `BET` of the same provider, player, wallet, currency and round. A reference that has not arrived yet parks the `WIN` in `PENDING_REFERENCE`, like a reversal.
+2. **`WIN` and `LOSS` may carry a reference.** When they do, the reference must resolve to a `PROCESSED` `BET` of the same provider, player, wallet, currency and round. A reference that has not arrived yet parks them in `PENDING_REFERENCE`, like a reversal. A `WIN` or `LOSS` for a `BET` that was reversed is `REJECTED` with `REFERENCE_ALREADY_REVERSED`: the stake went back to the player, so there is nothing left to settle. A `BET` never references another transaction; one that does is an invalid payload.
 3. **An unknown wallet is a contract error.** Nothing is persisted: HTTP answers 404 and the queue sends the message to the DLQ. Since nothing is stored, the idempotency key is not used up, and the same request succeeds once the wallet exists. A wallet that exists but belongs to another player or currency yields a persisted `REJECTED`, which keeps referential integrity and makes the attempt auditable.
 4. **A rejection is final for its idempotency key.** Resending the same request replays the rejection; changing the payload under the same key is a conflict. A provider that corrects a payload must send it as a new transaction, with a new `externalTransactionId`.
 5. **A replay returns the original result,** including the balance observed when the transaction was applied (§7, rule 7), from a snapshot stored with the transaction, never from the current balance.
 6. **An initial balance of zero** opens the wallet without an `OPENING` transaction, as §9 implies.
 7. **A pending reference makes its dependants wait.** When a transaction references one that is itself still `PENDING_REFERENCE` (the `ROLLBACK` of a `REFUND` whose `BET` has not arrived), it is parked in `PENDING_REFERENCE` too, with its own 15-minute deadline. It proceeds once the reference is `PROCESSED`. It is `REJECTED` with `REFERENCE_NOT_PROCESSED` if the reference ends `REJECTED` or `FAILED`, or is still pending when its own deadline passes. The worker handles the oldest pending transactions first, so chains resolve in order. Rejecting such a reversal at once would let an out-of-order chain end wrong: the `ROLLBACK` rejected, then the `REFUND` applied, leaving the player with a credit the provider meant to undo.
+8. **Amounts.** Every operation moves an amount above zero, except a `LOSS`, which may record zero: it reports the outcome of a round and never moves the balance. A reversal must have its reference's amount.
+9. **Rule precedence.** When several rules are broken, the first in this order is reported: the wallet's player, the currency, then the reference (missing, scope, kind, still pending, not processed, already reversed, amount), then funds. The scope of a reference is checked before anything else about it, so a provider learns nothing about transactions outside its own player, wallet and round.
+10. **A wallet mismatch discloses no balance.** A transaction rejected with `WALLET_PLAYER_MISMATCH` or `CURRENCY_MISMATCH` stores no observed balance, so neither its response nor its event shows the balance of a wallet that is not the caller's.
 
 ### 5.1 Failure codes (§7.2)
 
@@ -193,9 +200,9 @@ Every rejection carries a stable, machine-readable `failureCode`. The codes are 
 | `REVERSAL_WOULD_OVERDRAW` | A `ROLLBACK` of a `WIN` or `REFUND` would make the balance negative | Final. Reconcile with the operator: the player already spent the funds. |
 | `REFERENCE_NOT_FOUND` | The reference did not arrive within the 15-minute TTL | Send the referenced transaction, then the reversal again under a new id. |
 | `REFERENCE_MISMATCH` | The reference belongs to another provider, player, wallet, currency or round | Fix the payload and send it under a new id. |
-| `REFERENCE_KIND_NOT_ALLOWED` | `REFUND` of anything but a `BET`; `ROLLBACK` of anything but a `BET`, `WIN` or `REFUND`; `WIN` referencing anything but a `BET` | Fix the payload and send it under a new id. |
+| `REFERENCE_KIND_NOT_ALLOWED` | `REFUND` of anything but a `BET`; `ROLLBACK` of anything but a `BET`, `WIN` or `REFUND`; `WIN` or `LOSS` referencing anything but a `BET` | Fix the payload and send it under a new id. |
 | `REFERENCE_NOT_PROCESSED` | The reference exists but ended `REJECTED` or `FAILED`, or was still `PENDING_REFERENCE` when this transaction's deadline passed | Final. |
-| `REFERENCE_ALREADY_REVERSED` | The reference already has a `PROCESSED` `REFUND` or `ROLLBACK` | Final: the money has already moved back. |
+| `REFERENCE_ALREADY_REVERSED` | The reference already has a `PROCESSED` `REFUND` or `ROLLBACK`: a second reversal, or a `WIN` or `LOSS` for a reversed `BET` | Final: the money has already moved back. |
 | `AMOUNT_MISMATCH` | A reversal's amount differs from its reference's (partial reversals are out of scope, §7, rule 5) | Fix the payload and send it under a new id. |
 | `CURRENCY_MISMATCH` | The operation's currency differs from the wallet's | Fix the payload and send it under a new id. |
 | `WALLET_PLAYER_MISMATCH` | The wallet belongs to another player | Fix the payload and send it under a new id. |
@@ -219,8 +226,9 @@ The unit of concurrency is the wallet.
 - **Isolation.** PostgreSQL's default `READ COMMITTED` is enough: the row lock, not the isolation level, serializes the work, and a locked read always sees the latest committed balance.
 - **Bounded waits.** A 2-second `lock_timeout` turns a long wait into a transient error (503 `WALLET_BUSY`, or SQS redelivery) and increments the lock-conflict metric. Each transaction holds the wallet lock for milliseconds, so 2 seconds absorb the queue of a contended wallet, such as the 50 parallel copies of one bet that §13 tests, and still answer within the timeouts providers typically allow a wallet call. There is no retry loop inside a request.
 - **Database guards.** `CHECK (balance >= 0)`, the uniqueness of `(wallet_id, wallet_version)` in the ledger and the other schema guarantees ([section 8](#8-persistence-and-transactional-strategy)) reject what a bug in the application might let through.
-- **No global lock.** There is no shared mutex, no constant-key advisory lock and no row updated by every transaction: that is why counter-account balances are derived ([section 4.4](#44-double-entry-ledger)).
-- **Several instances.** No correctness depends on process memory. Workers claim rows with `FOR UPDATE SKIP LOCKED`, and migrations run in a single one-shot job.
+- **No global lock.** There is no shared mutex, no constant-key advisory lock and no row updated or locked by every transaction: that is why counter-account balances are derived ([section 4.4](#44-double-entry-ledger)), and why no foreign key points at a counter-account. A foreign-key check takes a `FOR KEY SHARE` lock on the referenced row at every commit; those locks do not block each other, but on a provider's settlement account every bet of every player would rewrite the same row's lock state, and any stronger lock on it, even by mistake, would serialize them all. Accounts are insert-only, and the deferred ledger check reads the counter-account without locking it.
+- **Several instances.** No correctness depends on process memory. The outbox publisher claims rows with `FOR UPDATE SKIP LOCKED`, and migrations run in a single one-shot job.
+- **Workers keep the lock order.** The retry worker picks due transactions without locking them, locks their wallet, then re-reads the transaction under that lock, so it never holds a transaction row while waiting for a wallet that a use case holds.
 
 Alternatives considered:
 
@@ -248,20 +256,44 @@ The inbox row (SQS entry only), the wager transaction, the wallet balance and ve
 
 ### Schema guarantees (§5, item 9)
 
-Uniqueness, immutability and non-negativity are enforced by PostgreSQL, not only by application code. The first migration will create:
+Uniqueness, immutability and non-negativity are enforced by PostgreSQL, not only by application code. The first migration creates six tables (`wallets`, `ledger_accounts`, `wager_transactions`, `ledger_entries`, `inbox_messages`, `outbox_messages`) and these guarantees, each proved by `test/integration/schema.test.ts` with raw SQL that bypasses the application:
 
 | Guarantee | Mechanism |
 |---|---|
 | One wallet per player and currency | unique `(player_id, currency)` |
-| No negative balance | `CHECK (balance >= 0)` |
+| No negative balance | `CHECK (balance >= 0)`, on the wallet and on both balances of every entry |
 | Idempotency | unique `idempotency_key`; unique `(provider_id, external_transaction_id)` |
 | One ledger entry per transaction | unique `transaction_id` in the ledger |
-| Gapless, duplicate-free wallet history | unique `(wallet_id, wallet_version)` in the ledger |
+| Gapless, duplicate-free wallet history | unique `(wallet_id, wallet_version)` in the ledger, plus the chain check below |
 | One reversal per reference | partial unique index on the reference, over `PROCESSED` `REFUND` and `ROLLBACK` |
-| Message deduplication | unique `(consumer_name, message_id)` in the inbox |
-| Append-only ledger | trigger rejecting `UPDATE` and `DELETE` |
-| Terminal transactions stay final | trigger rejecting updates to a terminal row |
-| Well-formed entries | `CHECK (amount > 0)`; debit and credit accounts differ; `balance_after = balance_before ± amount` |
+| One `OPENING` per wallet | partial unique index on the wallet, over `OPENING` |
+| Message deduplication | primary key `(consumer_name, message_id)` in the inbox |
+| Append-only ledger | trigger rejecting `UPDATE`, `DELETE` and `TRUNCATE`, on entries and on accounts |
+| No confirmed event is lost | trigger: an unpublished outbox row cannot be deleted or truncated, and only its publication schedule changes (attempts only go up); a published row is final and may then be purged |
+| Terminal transactions stay final | trigger: only a `PENDING_REFERENCE` row may change, and then only its outcome (status, failure code, observed balance, schedule); its deadline is fixed; nothing is deleted; `FAILED` is reachable only by that update |
+| Wallets keep their identity | trigger: owner, currency and creation time never change; wallets are never deleted |
+| Valid states | `CHECK`s: `PENDING` is never stored; failure codes only on `REJECTED` (never `INTERNAL_ERROR`) and `FAILED` (always `INTERNAL_ERROR`); `processed_at` exactly on `PROCESSED`; a parked row has a deadline and a next attempt no later than it; reference rules per kind; provider fields null only for `OPENING`; no observed balance on a wallet mismatch |
+| Well-formed entries | `CHECK (amount > 0)`; debit and credit accounts differ; the wallet is the debited account of a `DEBIT` and the credited one of a `CREDIT`; `balance_after = balance_before ± amount` |
+| One currency per movement | composite foreign key `(wallet, currency)` from each entry; the counter-account's currency is checked at commit |
+
+**Balance, ledger and transactions agree at every commit.** Deferred constraint triggers run at `COMMIT`, when every row of the unit of work is visible, and check that:
+
+- every `PROCESSED` transaction that moves the balance has its entry, and every entry records a `PROCESSED` transaction that moves the balance, with its wallet, amount and currency, in the direction its kind implies (a `ROLLBACK` mirrors its reference), against the right counter-account in the same currency (`FUNDING` for the `OPENING`, which is always version 1; the provider's own settlement account otherwise);
+- the snapshot stored with an applied transaction is the balance its entry ends at, so every replay of that frozen row answers what the first call did;
+- the entries of a wallet form an unbroken chain from a zero balance, each starting where the previous one ended;
+- the wallet holds the balance of its last entry, at that entry's version, and has its own ledger account. This is checked from both sides, so an entry written without touching the wallet row cannot slip in;
+- an applied transaction names its wallet's player and currency;
+- an applied transaction's reference is the provider's transaction it names: `PROCESSED`, same wallet, round and currency, of an allowed kind, with the same amount for a reversal, and never a reversed `BET` for a `WIN` or `LOSS`.
+
+Together these make `wallet.balance == balance rebuilt from the ledger` a property of the schema, not only an assertion in tests. The checks read rows by primary key or unique index, a handful of lookups per commit, and lock nothing. The remaining foreign keys lock only rows that belong to one wallet or one transaction.
+
+Foreign keys are deferred too, so a unit of work may write its rows in any order. Unique constraints are not deferred: an idempotency race fails at the insert, where the use case resolves it. A guard violation raises SQLSTATE 23000 and a consistency violation 23514, each naming the rule in the error's `constraint` field, which the log serializer keeps. Both mean a bug, answered 500; only a unique violation on the idempotency keys is an expected race. Their messages carry ids and versions, never amounts, because messages reach the logs; amounts go to `DETAIL`, which the serializer drops.
+
+The core reference rules are therefore written twice, in `applyWagerTransaction` and in SQL. The domain decides the outcome and its failure code; the schema only refuses a state that should never exist, whatever code wrote it.
+
+### Persistence records
+
+Records declare columns, primary keys and plain unique constraints, and nothing else: no relations, so repositories handle ids explicitly and nothing is loaded lazily. MikroORM cannot describe CHECKs, triggers, partial indexes or deferrable foreign keys, so its own schema diff against a migrated database would drop all of them. New migrations are therefore generated from the snapshot (the records as of the last migration), never from the database, and their SQL is reviewed by hand. Amounts map to decimal strings, never numbers. The outbox `sequence_number` is an identity column the application never writes.
 
 ### Migrations and connections
 
@@ -470,7 +502,9 @@ No user table or password hashing is ever built. Messages from the queue are a t
 - **Real processes.** Application instances run as real OS processes built from the current sources, so multi-instance scenarios use real parallelism and crash scenarios use `SIGKILL`.
   - Windows cannot deliver a catchable `SIGTERM`, so graceful shutdown is tested against a container.
 - **Determinism.** Tests wait on observable conditions, never on `sleep`.
-- **Final invariant.** Every integration and concurrency test ends by asserting that the wallet balance equals the balance rebuilt from the ledger.
+- **Final invariant.** Every integration and concurrency test ends by asserting that the wallet balance equals the balance rebuilt from the ledger (`ledgerDiscrepancies` in `test/support/ledger.ts`).
+- **The schema is tested on its own.** `test/integration/schema.test.ts` writes raw SQL that bypasses the application and proves each guarantee of [section 8](#8-persistence-and-transactional-strategy) by the SQLSTATE and the constraint name of the refusal, next to the valid case that commits. `test/integration/records.test.ts` round-trips the persistence records through MikroORM.
+- **Unit tests follow §13.** `test/unit/domain` covers `Money`, the `Wallet` invariants, the rules of each kind (including precedence, pending references and chains), currency conflicts and the payload hash with independently computed SHA-256 vectors. Time and randomness are fixed values, so backoff and deadlines are exact.
 - **Load test.** `bun run test:load` runs k6 through the proxy; today it is a smoke run. The real load test, reporting environment, methodology, throughput, p50/p95/p99, error rate, concurrency conflicts and outbox lag, comes after the mandatory scope.
 
 ## 16. Trade-offs and known limitations
@@ -488,6 +522,8 @@ No user table or password hashing is ever built. Messages from the queue are a t
 - **Currency.** Only `BRL` is exercised end to end.
 - **Authentication** is not implemented ([section 12](#12-authentication-2)).
 - **Scope.** Partial reversals are out of scope, as §7 (rule 5) allows.
+- **Rules in two places.** The reference rules exist in the domain and, as a backstop, in the schema's deferred checks; changing one means a migration for the other.
+- **Identifier limits.** Provider ids are capped at 64 characters, external, player, round and game ids at 128, idempotency keys at 255. The API validation must mirror these, or an oversized id becomes a 500 instead of a 400.
 
 ## 17. Open points
 

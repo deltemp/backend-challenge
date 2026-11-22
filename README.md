@@ -4,7 +4,7 @@ Solution to Jungle Gaming's backend technical challenge: a distributed financial
 
 The original challenge statement (in Portuguese) is kept verbatim in [docs/CHALLENGE.md](docs/CHALLENGE.md).
 
-> **Status:** the foundation is in place: configuration, structured logs, metrics, health checks, database migrations, SQS queue provisioning, three replicas behind a proxy, and the test harness. The wagering domain itself (wallets, transactions, ledger, inbox and outbox) is not implemented yet.
+> **Status:** the foundation is in place: configuration, structured logs, metrics, health checks, database migrations, SQS queue provisioning, three replicas behind a proxy, and the test harness. The domain model (wallets, transactions and their rules, the double-entry ledger, inbox and outbox) and the database schema are implemented and tested. The use cases, the wagering API, the SQS consumer and the background workers are not implemented yet.
 
 ## Stack
 

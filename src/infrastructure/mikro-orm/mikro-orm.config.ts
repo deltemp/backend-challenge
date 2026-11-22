@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { Migrator } from "@mikro-orm/migrations";
 import { defineConfig } from "@mikro-orm/postgresql";
 import type { DatabaseConfig } from "../config/config";
+import { PERSISTENCE_RECORDS } from "./records";
 
 export const MIGRATIONS_DIRECTORY = join(import.meta.dirname, "migrations");
 
@@ -14,14 +15,15 @@ export const MIGRATIONS_DIRECTORY = join(import.meta.dirname, "migrations");
 export function createMikroOrmOptions(database: DatabaseConfig) {
   return defineConfig({
     clientUrl: database.url,
-    entities: [],
-    discovery: { warnWhenNoEntities: false },
+    entities: PERSISTENCE_RECORDS,
     extensions: [Migrator],
     migrations: {
       path: MIGRATIONS_DIRECTORY,
       pathTs: MIGRATIONS_DIRECTORY,
       glob: "!(*.d).{js,ts}",
       emit: "ts",
+      // The migrator's own progress lines are plain text; the scripts report what they applied.
+      silent: true,
       transactional: true,
       allOrNothing: true,
       dropTables: false,

@@ -8,7 +8,7 @@ Solution to Jungle Gaming's backend challenge, "Distributed Wagering Processor":
 
 - **Requirements:** `docs/CHALLENGE.md`, the original statement in Portuguese. Never edit or translate it. `§N` below refers to its sections.
 - **Decisions and rationale:** `ARCHITECTURE.md`, a required deliverable. It holds the reasoning behind the rules in this file; keep both in sync.
-- **Status: scaffolded.** Configuration, logging, metrics, health checks, migration tooling, queue provisioning, the Compose stack and the test harness exist. The domain (`src/domain`, `src/application`) and every business feature do not exist yet. Keep "Commands" and "Layout" in line with reality, in the same change that alters them.
+- **Status: domain and schema implemented.** Configuration, logging, metrics, health checks, migration tooling, queue provisioning, the Compose stack and the test harness exist, and so do the domain model (`src/domain`), the persistence records and the first migration. The application layer (`src/application`: use cases and ports), the repositories and every business feature (API, consumer, workers) do not exist yet. Keep "Commands" and "Layout" in line with reality, in the same change that alters them.
 
 ### What is graded (§14)
 
@@ -86,15 +86,23 @@ Scripts must run on Windows, macOS and Linux: use Bun's cross-platform shell or 
 
 ```
 src/
-  domain/            (next) Money, Wallet, WagerTransaction, WalletLedgerEntry, InboxMessage,
-                     OutboxMessage, integration events, domain errors
+  domain/
+    money/           Money (decimal.js, exact, never rounds)
+    wallet/          Wallet aggregate
+    ledger/          WalletLedgerEntry, LedgerAccount, LedgerDirection
+    wagering/        WagerTransaction (state machine), FailureCode, payload hash,
+                     wager rules (applyWagerTransaction)
+    events/          IntegrationEvent and the four events
+    messaging/       InboxMessage, OutboxMessage
+    shared/          domain errors, FullJitterBackoff
   application/       (next) use cases and ports (repositories, unit of work, clock,
                      random source, id generator)
   infrastructure/
     config/          environment schema (Zod), loadConfig, ConfigModule (APP_CONFIG token)
     observability/   pino logger, request context (AsyncLocalStorage), metrics, HTTP middleware
-    mikro-orm/       ORM options, DatabaseModule, migrations/, Postgres readiness check;
-                     (next) persistence records and repositories
+    mikro-orm/       ORM options, DatabaseModule, Postgres readiness check;
+                     records/ (defineEntity, scalar-only), migrations/ (hand-written SQL and
+                     the diff snapshot); (next) repositories
     sqs/             SQS client, queue provisioning, SQS readiness check;
                      (next) consumer and publisher adapters
   interfaces/
@@ -104,12 +112,14 @@ src/
   main.ts            one entry point; APP_ROLES selects what runs
 scripts/             migrations.ts, provision.ts
 test/
-  support/           preload, per-file databases and queues, app processes
-  unit/  integration/  concurrency/  load/
+  support/           preload, per-file databases and queues, app processes, ledger invariant
+  unit/              unit/domain/ covers the §13 unit list
+  integration/       schema.test.ts proves every schema guarantee; records.test.ts the mappings
+  concurrency/  load/
 docker/nginx/        proxy configuration
 ```
 
-Dependency rule: `interfaces → application → domain`, and `infrastructure` implements the ports declared in `application`. `src/domain` imports nothing from NestJS, MikroORM, the AWS SDK, Zod or pino; decimal.js is its only runtime dependency. This is one bounded context: do not split it into feature modules.
+Dependency rule: `interfaces → application → domain`, and `infrastructure` implements the ports declared in `application`. `src/domain` imports nothing from NestJS, MikroORM, the AWS SDK, Zod or pino; decimal.js is its only package dependency, plus Node's built-in `node:crypto` for the payload hash (`test/unit/domain/dependency-rule.test.ts` enforces it). This is one bounded context: do not split it into feature modules.
 
 ## Pitfalls already found
 
@@ -127,6 +137,11 @@ Each of these cost time once. Do not rediscover them.
 - **The LocalStack image has no curl;** its healthcheck uses Python.
 - **Bun loads `.env` into every process started on the host** (dev, scripts, tests); containers get their environment from `compose.yaml`.
 - **Git Bash rewrites absolute-looking arguments** (`/scripts/x` becomes `C:/Program Files/Git/scripts/x`) when passing them to `docker`. Use the package scripts or PowerShell.
+- **Never let MikroORM generate schema SQL against a migrated database** (`orm.schema.update*`, `getUpdateSchemaSQL`). It does not model CHECKs, triggers, partial indexes or deferrable foreign keys, so its diff drops all of them. `migration:create` is safe because it diffs the records against `.snapshot.json`, not the database; review its output anyway. A record change with no schema change still needs the snapshot refreshed: run `bun run migration:create --blank --name=x` and delete the blank migration it writes.
+- **PL/pgSQL ends an `IF` condition at the first `THEN` outside parentheses,** including one inside a `CASE`: wrap a `CASE` in parentheses there. The error is a bare "syntax error at end of input".
+- **Bun SQL binds a JavaScript string for a `jsonb` column as a JSON string,** not as an object; pass the object itself.
+- **MikroORM infers optional `em.create` fields from defaults, not from generated columns:** the outbox `sequenceNumber` is typed `Opt<string>` so the application never has to (and never can usefully) pass it.
+- **The migrator is silent** (`silent: true`): its own progress lines are plain text, not JSON logs; the scripts print what they applied.
 
 ## Domain modeling (§6)
 
@@ -145,11 +160,14 @@ The class skeletons in §6 and §11 are the reference. Names may be adapted; gua
 
 - **Records are not domain objects.** MikroORM entities are persistence records defined with `defineEntity` under `src/infrastructure/mikro-orm`, without decorators. Repositories convert record → domain with `rehydrate`, and domain → managed record.
 - **One use case, one SQL transaction** (`em.transactional`). The inbox row (SQS entry only), the wager transaction, the wallet balance, the ledger entry and the outbox rows commit together or not at all.
-- **The concurrency unit is the wallet.** Take the wallet row lock (`LockMode.PESSIMISTIC_WRITE`, that is `SELECT … FOR UPDATE`) first: before reading anything the decision depends on, and before any other row lock. Look up the idempotency key under that lock. Bound the wait with `lock_timeout`; a timeout is a transient error and increments the lock-conflict metric.
+- **The concurrency unit is the wallet.** Take the wallet row lock (`LockMode.PESSIMISTIC_WRITE`, that is `SELECT … FOR UPDATE`) first: before reading anything the decision depends on, and before any other row lock. Look up the idempotency key under that lock. Bound the wait with `lock_timeout`; a timeout is a transient error and increments the lock-conflict metric. Workers follow the same order: the retry worker picks due transactions without locking them, locks their wallet (`SKIP LOCKED` on `wallets` is fine), then re-reads the transaction under that lock. Never lock `wager_transactions` rows before the wallet.
+- **No row shared by all wallets is ever locked, not even by a foreign key.** A foreign-key check locks the referenced row (`FOR KEY SHARE`) at every commit, so no foreign key points at a counter-account (a provider's settlement account is shared by all its wallets); the deferred ledger check reads the counter-account without locking it. Accounts are insert-only: get or create one with a read, then `INSERT … ON CONFLICT DO NOTHING` and a read again if it was missing; never lock or upsert-update an account row.
 - **Unique constraints are the backstop.** A unique violation on the idempotency key or on `(provider_id, external_transaction_id)` is resolved by rolling back and re-running once, which then finds the row and returns a replay or a conflict. It never surfaces as a 500.
 - `Wallet.version` starts at 1 on creation (the `OPENING` credit, when present, is part of creation) and increments only when the balance changes.
 - **Double-entry ledger.** One immutable row per financial transaction, with `debit_account_id`, `credit_account_id` and a positive `amount`, plus the wallet-side `balance_before`, `balance_after` and `wallet_version`. Accounts: `PLAYER_WALLET` (1:1 with a wallet), `PROVIDER_SETTLEMENT` (per provider and currency), `FUNDING` (per currency, used by `OPENING`). Counter-account balances are always derived by summing entries.
-- **Schema-level guarantees to implement and test:** one wallet per `(player_id, currency)`; `balance >= 0`; unique `idempotency_key`; unique `(provider_id, external_transaction_id)`; one ledger entry per transaction; unique `(wallet_id, wallet_version)` on the ledger; at most one `PROCESSED` reversal per referenced transaction (partial unique index); inbox unique on `(consumer_name, message_id)`; ledger rows reject `UPDATE` and `DELETE`; a wager transaction in a terminal state rejects further updates; `amount > 0`; debit and credit accounts differ; `balance_after` matches `balance_before ± amount`.
+- **Schema-level guarantees** (all implemented in the first migration and proved in `test/integration/schema.test.ts`; keep both in step): one wallet per `(player_id, currency)`; `balance >= 0`; unique `idempotency_key`; unique `(provider_id, external_transaction_id)`; one ledger entry per transaction; unique `(wallet_id, wallet_version)` on the ledger; at most one `PROCESSED` reversal per referenced transaction (partial unique index); one `OPENING` per wallet; inbox unique on `(consumer_name, message_id)`; ledger rows and ledger accounts reject `UPDATE`, `DELETE` and `TRUNCATE`; a wager transaction in a terminal state rejects further updates, a parked one changes only its outcome, and none is deleted; `FAILED` only from a stored `PENDING_REFERENCE`; `PENDING` is never stored; wallets are never deleted and their owner and currency never change; an unpublished outbox event cannot be deleted or truncated and changes only its publication schedule, and a published one is final (it may then be purged); amounts above zero (a `LOSS` may be zero, a ledger amount never); debit and credit accounts differ; the wallet is on its own side of each entry; `balance_after` matches `balance_before ± amount`; a composite foreign key keeps an entry in its wallet's currency. **Deferred constraint triggers** check at commit that balance, ledger and transactions agree: every applied balance-moving transaction has its entry and every entry its applied transaction (kind, amount, direction, counter-account and its currency, and the stored snapshot equal to the entry's `balance_after`); the entries of a wallet chain unbroken from zero; the wallet holds the balance of its last entry, whether or not its row was touched; an applied transaction names its wallet's player and currency; and its reference matches it (scope, kind, a reversal's amount, no settling of a reversed bet). `wallet.balance == balance rebuilt from the ledger` is therefore a schema guarantee.
+- **Foreign keys are deferred** (`DEFERRABLE INITIALLY DEFERRED`), so a unit of work may flush its rows in any order; unique constraints are not, so idempotency races fail at the insert. Guard violations raise SQLSTATE 23000 and consistency violations 23514, each naming the rule in the error's `constraint` field; both are bugs (500), unlike 23505 on the idempotency keys. Trigger messages carry ids and versions, never amounts, because they reach the logs; amounts go to `DETAIL`, which the log serializer drops.
+- **Records map columns only, with no relations.** Repositories resolve ids explicitly; the schema enforces the links between rows.
 - **Migrations** are MikroORM migrations with hand-reviewed SQL. Every `up()` has a `down()` that works, covered by an up → down → up test. Do not rewrite a committed migration without asking.
 - **Application processes never run DDL.** `ensureDatabase` is off: databases come from compose or the test harness, the schema only from migrations.
 - **Connection limits** live in `createMikroOrmOptions` and come from the environment: a 5-second connection timeout, so an unreachable database fails fast as a transient error, and a 30-second `idle_in_transaction_session_timeout`, so PostgreSQL releases the row locks of a process that stalled or vanished mid-transaction.
@@ -162,7 +180,13 @@ Each of these was decided with the maintainer. Implement them as written; if one
 ### Business rules and interpretations (§7)
 
 - A referenced transaction can have at most one `PROCESSED` reversal. `REFUND` and `ROLLBACK` of the same transaction are mutually exclusive, and the second one is `REJECTED` with `REFERENCE_ALREADY_REVERSED`. This is stricter than the statement on purpose, to prevent a double credit. A `REFUND` undone by a `ROLLBACK` does not reopen the `BET` for a new `REFUND` (documented limitation).
-- `WIN` may carry a reference. When present, it must resolve to a `PROCESSED` `BET` of the same provider, player, wallet, currency and round.
+- `WIN` and `LOSS` may carry a reference. When present, it must resolve to a `PROCESSED` `BET` of the same provider, player, wallet, currency and round; a `WIN` or `LOSS` for a `BET` that was reversed is `REJECTED` with `REFERENCE_ALREADY_REVERSED`. A `BET` with a reference is an invalid payload (400).
+- Amounts are above zero, except that a `LOSS` may record zero (it never moves the balance). A reversal must have its reference's amount (`AMOUNT_MISMATCH`).
+- When several rules are broken, the first in this order is reported: `WALLET_PLAYER_MISMATCH`, `CURRENCY_MISMATCH`, then the reference (missing: wait; `REFERENCE_MISMATCH`; `REFERENCE_KIND_NOT_ALLOWED`; still pending: wait; `REFERENCE_NOT_PROCESSED`; `REFERENCE_ALREADY_REVERSED`; `AMOUNT_MISMATCH`), then funds (`INSUFFICIENT_FUNDS` for a `BET`, `REVERSAL_WOULD_OVERDRAW` for a `ROLLBACK`). The scope of a reference comes before anything else about it, so a provider learns nothing about transactions outside its player, wallet and round. `applyWagerTransaction` implements this order.
+- A wallet mismatch (`WALLET_PLAYER_MISMATCH`, `CURRENCY_MISMATCH`) stores no observed balance (a CHECK enforces it), so neither the response nor the event shows another player's balance.
+- The `OPENING` credit is created already `PROCESSED`, in the wallet's SQL transaction, with no provider fields and no idempotency key (null in the schema and in events); a partial unique index allows one per wallet. A wallet opened at zero has no `OPENING` and no ledger entry, so its first movement is version 2.
+- Identifier limits, enforced by the schema, which the API validation must mirror (otherwise an oversized id becomes a 500 instead of a 400): `providerId` up to 64 characters; `externalTransactionId`, `referenceExternalTransactionId`, `playerId`, `roundId` and `gameId` up to 128; `Idempotency-Key` up to 255.
+- The schema backs the bookkeeping with deferred constraint triggers: balance, ledger and transactions must agree at every commit (see "Persistence").
 - A missing reference is persisted as `PENDING_REFERENCE` and retried by a scheduled worker until a deadline 15 minutes after receipt (see "Retry policies"). On expiry the transaction becomes `REJECTED` with `REFERENCE_NOT_FOUND` and the matching event is published.
 - A reference that exists but is itself still `PENDING_REFERENCE` (the `ROLLBACK` of a `REFUND` whose `BET` has not arrived) parks the new transaction in `PENDING_REFERENCE` too, with its own 15-minute deadline. It proceeds once the reference is `PROCESSED`. It is `REJECTED` with `REFERENCE_NOT_PROCESSED` if the reference ends `REJECTED` or `FAILED`, or is still pending when its own deadline passes. The worker processes the oldest pending transactions first, so chains resolve in order.
 - State machine: `PENDING → PROCESSED | REJECTED | FAILED | PENDING_REFERENCE`, and `PENDING_REFERENCE → PROCESSED | REJECTED | FAILED`. Nothing leaves a terminal state.
@@ -224,7 +248,7 @@ Protocol errors use RFC 9457 `application/problem+json`: `type` is `about:blank`
 - While PostgreSQL or SQS is unreachable, the consumer stops receiving and probes the dependency with backoff before resuming. An outage therefore does not use up the 5 receives and does not push healthy messages to the DLQ; per-message backoff is left for isolated failures such as a lock timeout.
 - Producers are expected to use `walletId` as `MessageGroupId`. Correctness must not depend on it.
 - On `SIGTERM`, stop polling, then finish in-flight messages or return their visibility. The queue's default long poll (20 s) is longer than the shutdown budget (`SHUTDOWN_TIMEOUT_MS`, 10 s): pass an `AbortSignal` to every `ReceiveMessage` and abort it as the first shutdown step, and set `WaitTimeSeconds` on each call. Keep the shutdown budget above the longest message processing plus the visibility calls, and below compose's `stop_grace_period` (15 s).
-- Outbox: workers poll with `FOR UPDATE SKIP LOCKED`, publish at-least-once to `wager-events.fifo` (`MessageGroupId = walletId`, `MessageDeduplicationId = eventId`), then mark the rows as published. A crash between commit and publish must be recovered by another instance. A failed publish reschedules the row; it is never dropped.
+- Outbox: workers poll with `FOR UPDATE SKIP LOCKED`, publish at-least-once to `wager-events.fifo` (`MessageGroupId = walletId`, `MessageDeduplicationId = eventId`), then mark the rows as published. A crash between commit and publish must be recovered by another instance. A failed publish reschedules the row; it is never dropped. A published row is final in the schema: hold the row lock from claim to marking, and mark with `… WHERE published_at IS NULL`, so a repeated publication is a no-op rather than a trigger error.
 - Events are published in commit order per wallet: only the oldest unpublished event of each wallet is eligible, ordered by a database sequence assigned at insert, under the wallet lock (never by UUIDv7, which follows each instance's clock). Concurrent publishers therefore never hold two events of the same wallet. An event that keeps failing holds back the later events of its wallet only, and the 10-attempt gauge raises the alert.
 - Minimum events: `WagerTransactionProcessed` (every applied transaction, including `LOSS`), `WagerTransactionRejected`, `WalletBalanceChanged` (only when the balance changes), `WagerTransactionPendingReference`.
 

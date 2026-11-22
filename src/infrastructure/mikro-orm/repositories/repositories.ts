@@ -331,19 +331,31 @@ class MikroOrmOutboxRepository implements OutboxRepository {
   }
 
   async claimDue(now: Date, limit: number): Promise<OutboxMessage[]> {
-    // The head of each wallet's queue: no unpublished event of the same wallet comes before it.
-    // A head held by another publisher is skipped, and the events behind it are excluded too,
-    // so no two publishers ever hold events of the same wallet.
+    // The head of each wallet's queue: the lowest unpublished sequence of its wallet. A head
+    // held by another publisher is skipped, and the events behind it are excluded too (the head
+    // is still unpublished), so no two publishers ever hold events of the same wallet.
+    //
+    // The candidates come in sequence order from outbox_messages_unpublished_sequence_idx. The
+    // head test is a scalar subquery on purpose: PostgreSQL runs it per candidate, through
+    // outbox_messages_pending_idx, whatever its statistics say. Written as NOT EXISTS, it became
+    // an anti-join, and with the statistics of an outbox that was empty at its last analyze,
+    // the planner scanned every pending event for each candidate (80 ms per claim behind a
+    // 23,000-event backlog, until autoanalyze caught up).
+    //
+    // `o.published_at is null` is what lets PostgreSQL use that partial index (the planner
+    // proves an index predicate from the query's own conditions, never from a CHECK): without
+    // it, the claim walks the unique index through every event ever published. On the READ
+    // COMMITTED re-check, it also excludes a row another round published meanwhile, as
+    // `o.next_attempt_at <= ?` does through outbox_messages_schedule_check.
     const claimed = await this.em.execute<{ id: string }[]>(
       `select o.id
        from outbox_messages o
        where o.published_at is null
          and o.next_attempt_at <= ?
-         and not exists (
-           select 1 from outbox_messages earlier
-           where earlier.ordering_key = o.ordering_key
-             and earlier.published_at is null
-             and earlier.sequence_number < o.sequence_number)
+         and o.sequence_number = (
+           select min(head.sequence_number) from outbox_messages head
+           where head.ordering_key = o.ordering_key
+             and head.published_at is null)
        order by o.sequence_number
        limit ?
        for update of o skip locked`,

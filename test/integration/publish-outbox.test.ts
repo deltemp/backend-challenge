@@ -166,6 +166,36 @@ describe("PublishOutbox", () => {
     await receiveAll(sqs, queues.urls.wagerEvents, 2);
   });
 
+  test("a head another publisher holds blocks the events behind it, and only those", async () => {
+    const { harness, queues } = setup();
+    const { useCases, sql } = harness;
+    const held = await openWallet(useCases, "100.00");
+    const free = await openWallet(useCases, "100.00");
+    const heads: { id: string }[] = await sql`
+      select id from outbox_messages where ordering_key = ${held.id}
+      order by sequence_number limit 1`;
+    const headId = heads[0]?.id ?? "";
+
+    // Another publisher's round holds the head of the first wallet's queue.
+    const whileHeld = await sql.begin(async (tx) => {
+      await tx`select id from outbox_messages where id = ${headId} for update`;
+      return useCases.publishOutbox.execute({ limit: 10 });
+    });
+
+    // Its second event waits too: it is not the head while the head is unpublished.
+    expect(whileHeld).toMatchObject({ claimed: 1, published: 1 });
+    expect((await outboxRows(sql, held.id)).map((row) => row.published)).toEqual([false, false]);
+    expect((await outboxRows(sql, free.id)).map((row) => row.published)).toEqual([true, false]);
+
+    // Released: the next round takes the head of each queue.
+    expect(await useCases.publishOutbox.execute({ limit: 10 })).toMatchObject({
+      claimed: 2,
+      published: 2,
+    });
+    expect((await outboxRows(sql, held.id)).map((row) => row.published)).toEqual([true, false]);
+    await receiveAll(sqs, queues.urls.wagerEvents, 3);
+  });
+
   test("marking an event another round already published changes nothing and fails nothing", async () => {
     const { harness } = setup();
     const { useCases, sql, orm } = harness;
